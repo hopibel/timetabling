@@ -4,7 +4,8 @@ import random
 import numpy
 from deap import algorithms, base, creator, tools
 
-SLOTS = 90
+DAY_SLOTS = 28
+SLOTS = DAY_SLOTS * 5
 
 
 def gen_ind(courses, rooms):
@@ -14,17 +15,25 @@ def gen_ind(courses, rooms):
         length = course['length']
         room = random.choice(rooms)
         if course['split'] and random.random() < 80:  # 80% of classes are twice a week
-            ind.append([
-                {
-                    'slot': random.randrange(SLOTS - length // 2),
+            if length % 2 != 0:
+                raise ValueError("Splittable class '{}' has odd length".format(course['name']))
+
+            sessions = []
+            for _ in range(2):
+                day = DAY_SLOTS * random.randrange(5)
+                slot = day + random.randrange(DAY_SLOTS - length // 2)
+                sessions.append({
+                    'slot': slot,
                     'len': length // 2,
                     'room': room,
-                } for _ in range(2)
-            ])
+                })
+            ind.append(sessions)
         else:
+            day = DAY_SLOTS + random.randrange(5)
+            slot = day + random.randrange(DAY_SLOTS - length)
             ind.append([
                 {
-                    'slot': random.randrange(SLOTS - length),
+                    'slot': slot,
                     'len': length,
                     'room': room,
                 },

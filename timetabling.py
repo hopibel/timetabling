@@ -80,30 +80,31 @@ def mut_timetable(individual, rooms):
     course = random.choice(individual)
     session = random.choice(course)
 
-    x = random.random()
-    if x < 0.5:
+    if random.random() < 0.5:
         # shift timeslot
-        session['slot'] += random.choice((1, -1))
+        shift = random.choice((1, -1))
+
+        # bounds checking
+        # if moving one way goes out of bounds, move the other way
+        if session['slot'] + shift < 0 or session['slot'] + session['len'] + shift > SLOTS:
+            shift = -shift
+
+        session['slot'] += shift
+
+        # day boundary checking
+        # fully move across boundary
+        start = session['slot']
+        end = start + session['len'] - 1
+        if start // DAY_SLOTS != end // DAY_SLOTS:
+            if shift == 1:
+                session['slot'] = end // DAY_SLOTS
+            else:
+                session['slot'] = end // DAY_SLOTS - session['len']
     else:
         # change room
         session['room'] = random.choice(rooms)
 
     # TODO: change split to single or vice versa
-
-    # bounds checking
-    # if moving one way goes out of bounds, move the other way
-    if session['slot'] < 0:
-        session['slot'] = 1
-    elif session['slot'] + session['len'] >= SLOTS:
-        session['slot'] = SLOTS - session['len'] - 1
-
-    # day boundary checking
-    # randomly put it on one side of the boundary
-    start = session['slot']
-    end = start + session['len'] - 1
-    if start // 18 != end // 18:
-        bound = int(end / 18) * 18
-        session['slot'] = random.choice((bound - session['len'], bound))
 
     return (individual,)
 
@@ -115,7 +116,7 @@ def main():
 
     # dummy course table
     courses = []
-    for name in 'abcdefghijklmnopqr':
+    for name in range(18):
         for sec in range(1, 3):
             course = {
                 'name': name,

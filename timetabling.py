@@ -71,17 +71,19 @@ def eval_timetable(individual):
     return (overlap,)
 
 
-def mut_timetable(individual, rooms):
+def mut_timetable(ind, rooms, courses):
     """Mutate a timetable.
 
     Shift a class timeslot by 1
     Change classrooms
+    Toggle split status
     """
-    course = random.choice(individual)
+    i = random.randrange(len(ind))
+    course = ind[i]
     session = random.choice(course)
 
-    if random.random() < 0.5:
-        # shift timeslot
+    def shift_slot():
+        """Shift class forward or back by one time slot."""
         shift = random.choice((1, -1))
 
         # bounds checking
@@ -97,16 +99,37 @@ def mut_timetable(individual, rooms):
         end = start + session['len'] - 1
         if start // DAY_SLOTS != end // DAY_SLOTS:
             if shift == 1:
-                session['slot'] = end // DAY_SLOTS
+                session['slot'] = end // DAY_SLOTS * DAY_SLOTS
             else:
-                session['slot'] = end // DAY_SLOTS - session['len']
-    else:
-        # change room
-        session['room'] = random.choice(rooms)
+                session['slot'] = end // DAY_SLOTS * DAY_SLOTS - session['len']
 
-    # TODO: change split to single or vice versa
+            if session['slot'] < 0:
+                print("{} {} {} {}".format(session, start, end, shift))
 
-    return (individual,)
+    def change_room():
+        """Change a course's room assignment."""
+        room = random.choice(rooms)
+        for sess in course:
+            sess['room'] = room
+
+    def toggle_split():
+        """If a course is split, unsplit it and vice versa."""
+        if len(course) > 1:
+            # merge other sessions into this one
+            session['len'] = sum([s['len'] for s in course])
+            ind[i] = [session]
+        else:
+            # split into two half length sessions
+            session['len'] //= 2
+            ind[i].append(session.copy())
+
+    # call a random mutator
+    muts = [shift_slot, change_room]
+    if courses[i]['split']:
+        muts.append(toggle_split)
+    random.choice(muts)()
+
+    return (ind,)
 
 
 def main():
@@ -143,7 +166,7 @@ def main():
 
     toolbox.register("evaluate", eval_timetable)
     toolbox.register("mate", tools.cxOnePoint)
-    toolbox.register("mutate", mut_timetable, rooms=rooms)
+    toolbox.register("mutate", mut_timetable, rooms=rooms, courses=courses)
     toolbox.register("select", tools.selTournament, tournsize=2)
 
     gens = 100  # generations
@@ -162,6 +185,8 @@ def main():
 
     algorithms.eaMuPlusLambda(
         pop, toolbox, mu, lambd, cxpb, mutpb, gens, stats=stats, halloffame=hof, verbose=True)
+
+    print(hof[0])
 
 
 if __name__ == '__main__':

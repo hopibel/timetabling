@@ -10,62 +10,37 @@ SLOTS = DAY_SLOTS * 5
 
 def gen_ind(courses, rooms, faculty):
     """Generate individual."""
-    # assume faculty availability is enough for classes
-    # choose random slot where faculty is available
     ind = []
     for course in courses:
         prof = course['faculty']
 
         length = course['length']
         room = random.choice(rooms)
+        splits = 1
 
-        # TODO: do away with random splitting entirely. all split classes have 2 meetings
-        # lets us determine if faculty availability >= faculty load
-        # TODO: duplication. refactor
-        if course['split'] and random.random() < 1:  # 80% of classes are twice a week (100% for now)
-            # indexes of availability blocks large enough to hold this class
-            blocks = [i for i, r in enumerate(faculty[prof]) if r[1]-r[0]+1 >= length // 2]
-            if blocks == []:
-                raise ValueError("{} doesn't fit in {}'s schedule".format(course['name'], prof))
+        if length % 2 != 0:
+            raise ValueError("Splittable class '{}' has odd length".format(course['name']))
 
-            if length % 2 != 0:
-                raise ValueError("Splittable class '{}' has odd length".format(course['name']))
+        if course['split']:
+            length /= 2
+            splits = 2
 
-            sessions = []
-            for _ in range(2):
-                # day = DAY_SLOTS * random.randrange(5)
-                # slot = day + random.randrange(DAY_SLOTS - length // 2)
-                i = random.choice(blocks)
-                start, end = faculty[prof][i]
-                slot = random.randrange(start, end+1 - length // 2)
-                sessions.append({
-                    'slot': slot,
-                    'len': length // 2,
-                    'room': room,
-                    'prof': prof,
-                    'block': i,
-                })
-            ind.append(sessions)
-        else:
-            # indexes of availability blocks large enough to hold this class
-            blocks = [i for i, r in enumerate(faculty[prof]) if r[1]-r[0]+1 >= length]
-            if blocks == []:
-                raise ValueError("{} doesn't fit in {}'s schedule".format(course['name'], prof))
+        # indexes of availability blocks large enough to hold this class
+        blocks = [i for i, r in enumerate(faculty[prof]) if r[1]-r[0]+1 >= length]
 
-            # day = DAY_SLOTS + random.randrange(5)
-            # slot = day + random.randrange(DAY_SLOTS - length)
+        sessions = []
+        for _ in range(splits):
             i = random.choice(blocks)
             start, end = faculty[prof][i]
-            slot = random.randrange(start, end+1 - length // 2)
-            ind.append([
-                {
-                    'slot': slot,
-                    'len': length,
-                    'room': room,
-                    'prof': prof,
-                    'block': i,
-                },
-            ])
+            slot = random.randrange(start, end+1 - length)
+            sessions.append({
+                'slot': slot,
+                'len': length,
+                'room': room,
+                'prof': prof,
+                'block': i,
+            })
+        ind.append(sessions)
     return ind
 
 
@@ -228,6 +203,34 @@ def main():
     # dummy room table
     rooms = tuple(range(3))
 
+    # check if faculty have enough contiguous blocks for each class
+    for name in faculty:
+        avail_length = []
+        for block in faculty[name]:
+            avail_length.append(block[1] - block[0] + 1)
+        avail_length.sort()
+
+        class_length = []
+        for course in [x for x in courses if x['faculty'] == name]:
+            if course['split'] == 1:
+                class_length.append(course['length'] // 2)
+                class_length.append(course['length'] // 2)
+            else:
+                class_length.append(course['length'])
+        class_length.sort()
+
+        i = 0
+        j = 0
+        while i < len(class_length):
+            if j >= len(avail_length):
+                raise ValueError("Faculty member {} can't teach all their classes".format(name))
+
+            if avail_length[j] >= class_length[i]:
+                avail_length[j] -= class_length[i]
+                i += 1
+            else:
+                j += 1
+
     creator.create("Fitness", base.Fitness, weights=(-1.0,))
     creator.create("Individual", list, fitness=creator.Fitness)
 
@@ -241,7 +244,7 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register("select", tools.selTournament, tournsize=2)
 
-    gens = 500  # generations
+    gens = 160  # generations
     mu = 1000  # population size
     lambd = 1000  # offspring to create
     cxpb = 0.8  # crossover probability

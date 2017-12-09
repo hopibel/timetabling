@@ -22,7 +22,7 @@ def gen_ind(courses, rooms, faculty):
             raise ValueError("Splittable class '{}' has odd length".format(course['name']))
 
         if course['split']:
-            length /= 2
+            length //= 2
             splits = 2
 
         # indexes of availability blocks large enough to hold this class
@@ -261,7 +261,8 @@ def main():
     algorithms.eaMuPlusLambda(
         pop, toolbox, mu, lambd, cxpb, mutpb, gens, stats=stats, halloffame=hof, verbose=True)
 
-    print(hof[0])
+    for course in hof[0]:
+        print(course)
 
 
 if __name__ == '__main__':

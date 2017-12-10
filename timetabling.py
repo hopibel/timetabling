@@ -1,6 +1,7 @@
 """Timetabling using a genetic algorithm"""
 
 import random
+from collections import defaultdict
 import numpy
 from deap import algorithms, base, creator, tools
 
@@ -34,6 +35,8 @@ def gen_ind(courses, rooms, faculty):
             start, end = faculty[prof][i]
             slot = random.randrange(start, end+1 - length)
             sessions.append({
+                'name': course['name'],
+                'section': course['section'],
                 'slot': slot,
                 'len': length,
                 'room': room,
@@ -41,6 +44,7 @@ def gen_ind(courses, rooms, faculty):
                 'block': i,
             })
         ind.append(sessions)
+
     return ind
 
 
@@ -50,7 +54,6 @@ def eval_timetable(individual):
     Currently returns:
     Number of overlapping classes
     """
-    # TODO: also count faculty conflict (multiple classes at once)
     overlap = 0
 
     times = []
@@ -171,6 +174,113 @@ def mut_timetable(ind, rooms, faculty):
     return (ind,)
 
 
+def to_html(ind):
+    """Convert timetable to html table."""
+    rooms = defaultdict(list)
+    for course in ind:
+        for session in course:
+            rooms[session['room']].append({
+                'name': "{}-{}".format(session['name'], session['section']),
+                'start': session['slot'],
+                'end': session['slot'] + session['len'] - 1,
+            })
+
+    tables = {}
+    for key, room in rooms.items():
+        points = []  # list of (offset, plus/minus, name) tuples
+        for course in room:
+            points.append((course['start'], '+', course['name']))
+            points.append((course['end'], '-', course['name']))
+        points.sort(key=lambda x: x[1])
+        points.sort(key=lambda x: x[0])
+
+        ranges = []  # output list of (start, stop, symbol_set) tuples
+        current_set = []
+        last_start = None
+        offset = points[0][0]
+        for offset, pm, name in points:
+            if pm == '+':
+                if last_start is not None and current_set and offset - last_start > 0:
+                    ranges.append((last_start, offset-1, current_set.copy()))
+                current_set.append(name)
+                last_start = offset
+            elif pm == '-':
+                if offset >= last_start:
+                    ranges.append((last_start, offset, current_set.copy()))
+                current_set.remove(name)
+                last_start = offset+1
+
+        cells = []
+        last_slot = 0
+        for r in ranges:  # ranges = list of (start, end, {names})
+            if r[0] > last_slot:
+                for i in range(last_slot, r[0]):
+                    cells.append((i, i, []))
+            cells.append(r)
+            last_slot = r[1] + 1
+        for i in range(last_slot+1, SLOTS):
+            cells.append((i, i, []))
+
+        rows = list([] for _ in range(DAY_SLOTS))
+        for cell in cells:
+            rows[cell[0] % DAY_SLOTS].append(cell)
+
+        table = []
+        table.append("<table>")
+        table.append("""
+<tr>
+<th>Monday</th>
+<th>Tuesday</th>
+<th>Wednesday</th>
+<th>Thursday</th>
+<th>Friday</th>
+</tr>
+"""[1:-1])
+        for i, row in enumerate(rows):
+            table.append("<tr>")
+            table.append("<td>{}</td>".format(str(600 + 100*(i//2) + (i % 2)*30).zfill(4)))
+            for cell in row:
+                if cell[2] == []:
+                    table.append("<td>&nbsp;</td>")
+                else:
+                    line = "<td"
+                    if cell[1] > cell[0]:
+                        line += " rowspan={}".format(cell[1] - cell[0] + 1)
+                    if len(cell[2]) > 1:
+                        line += " class=overlap"
+                    else:
+                        line += " class=course"
+                    line += ">"
+                    line += "<br>".join(str(x) for x in cell[2])
+                    line += "</td>"
+                    table.append(line)
+            table.append("</tr>")
+        table.append("</table>")
+        tables[key] = table
+
+    html = []
+    # boilerplate
+    html.append("""
+<head>
+<style>
+table { border-collapse: collapse; }
+table, th, td { border: 1px solid black; }
+td { text-align: center; }
+.overlap { background-color: orange; }
+.course { background-color: #93c572; }
+</style>
+</head>
+"""[1:-1])
+    for name, table in tables.items():
+        html.append("<b>Room {}</b><br>".format(name))
+        for line in table:
+            html.append(line)
+
+    with open('room_sched.html', 'w') as outfile:
+        for line in html:
+            outfile.write(line + "\n")
+
+
 def main():
     """Entry point if called as executable."""
 
@@ -244,7 +354,8 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register("select", tools.selTournament, tournsize=2)
 
-    gens = 160  # generations
+    # 160 gens with this seed
+    gens = 50  # generations
     mu = 1000  # population size
     lambd = 1000  # offspring to create
     cxpb = 0.8  # crossover probability
@@ -261,8 +372,7 @@ def main():
     algorithms.eaMuPlusLambda(
         pop, toolbox, mu, lambd, cxpb, mutpb, gens, stats=stats, halloffame=hof, verbose=True)
 
-    for course in hof[0]:
-        print(course)
+    to_html(hof[0])
 
 
 if __name__ == '__main__':

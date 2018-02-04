@@ -1,9 +1,11 @@
 """Timetabling using a genetic algorithm"""
 
 import random
-from collections import defaultdict
+from collections import defaultdict, Counter
+import math
 import numpy
 from deap import algorithms, base, creator, tools
+import plan_gen
 
 DAY_SLOTS = 28
 SLOTS = DAY_SLOTS * 5
@@ -286,9 +288,19 @@ def main():
 
     random.seed('feffy')
 
+    # dummy study plans (only used to generate classes right now)
+    course_names = ['CS', 'Bio', 'Stat', 'Phys', 'ChemEng', 'Math']
+    plans = plan_gen.generate_study_plans(course_names)
+
+    classes = []
+    for course in plans:
+        for year in course:
+            classes.extend(year)
+    class_counts = Counter(classes)
+
     # dummy faculty availability
     faculty = {}
-    for i in range(9):
+    for i in range(math.ceil(len(classes) / 3)):
         faculty[i] = []
         for day in range(5):
             day *= DAY_SLOTS
@@ -297,21 +309,24 @@ def main():
 
     # dummy course table
     courses = []
-    for name in range(18):
-        for sec in range(1, 3):
+    faculty_assigned = 0
+    for name in class_counts:
+        for sec in range(1, class_counts[name]+1):
             course = {
                 'name': name,
                 'section': sec,
                 'length': 6,
                 'split': 1,
-                'faculty': name // 2,
+                'faculty': faculty_assigned // 3,  # three classes per teacher
             }
             if random.random() < 0.2:
                 course['split'] = 0
             courses.append(course)
+            faculty_assigned += 1
 
-    # dummy room table
-    rooms = tuple(range(3))
+    # dummy room list
+    # if a room can hold 5 classes per day, we need 1 room for every 25 classes
+    rooms = tuple(range(math.ceil(len(classes) / 25)))
 
     # check if faculty have enough contiguous blocks for each class
     for name in faculty:
@@ -355,7 +370,7 @@ def main():
     toolbox.register("select", tools.selTournament, tournsize=2)
 
     # 160 gens with this seed
-    gens = 50  # generations
+    gens = 200  # generations
     mu = 1000  # population size
     lambd = 1000  # offspring to create
     cxpb = 0.8  # crossover probability

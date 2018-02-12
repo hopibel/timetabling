@@ -11,28 +11,28 @@ DAY_SLOTS = 28
 SLOTS = DAY_SLOTS * 5
 
 
-def gen_ind(courses, rooms, faculty):
+def gen_ind(course_table, rooms, faculty):
     """Generate individual."""
     ind = []
-    for course in courses:
+    for course in course_table:
         prof = course['faculty']
 
         length = course['length']
         room = random.choice(rooms)
-        splits = 1
+        meetings = 1
 
         if length % 2 != 0:
             raise ValueError("Splittable class '{}' has odd length".format(course['name']))
 
-        if course['split']:
+        if course['twice_a_week']:
             length //= 2
-            splits = 2
+            meetings = 2
 
         # indexes of availability blocks large enough to hold this class
         blocks = [i for i, r in enumerate(faculty[prof]) if r[1]-r[0]+1 >= length]
 
         sessions = []
-        for _ in range(splits):
+        for _ in range(meetings):
             i = random.choice(blocks)
             start, end = faculty[prof][i]
             slot = random.randrange(start, end+1 - length)
@@ -84,7 +84,7 @@ def mut_timetable(ind, rooms, faculty):
 
     Shift a class timeslot by 1
     Change classrooms
-    Toggle split status
+    Toggle twice a week status
     """
     i = random.randrange(len(ind))
     course = ind[i]
@@ -155,22 +155,10 @@ def mut_timetable(ind, rooms, faculty):
         for sess in course:
             sess['room'] = room
 
-#    def toggle_split():
-#        """If a course is split, unsplit it and vice versa."""
-#        # NOTE: disabled for now
-#        if len(course) > 1:
-#            # merge other sessions into this one
-#            session['len'] = sum([s['len'] for s in course])
-#            ind[i] = [session]
-#        else:
-#            # split into two half length sessions
-#            session['len'] //= 2
-#            ind[i].append(session.copy())
+    # TODO: add a swap mutation (slot or room)
 
     # call a random mutator
     muts = [shift_slot, change_room]
-    # if courses[i]['split']:
-    #     muts.append(toggle_split)
     random.choice(muts)()
 
     return (ind,)
@@ -231,6 +219,7 @@ def to_html(ind):
         table.append("<table>")
         table.append("""
 <tr>
+<th>Time</th>
 <th>Monday</th>
 <th>Tuesday</th>
 <th>Wednesday</th>
@@ -289,12 +278,12 @@ def main():
     random.seed('feffy')
 
     # dummy study plans (only used to generate classes right now)
-    course_names = ['CS', 'Bio', 'Stat', 'Phys', 'ChemEng', 'Math']
-    plans = plan_gen.generate_study_plans(course_names)
+    programs = ['CS', 'Bio', 'Stat']
+    plans = plan_gen.generate_study_plans(programs)
 
     classes = []
-    for course in plans:
-        for year in course:
+    for course in plans.values():
+        for year in course.values():
             classes.extend(year)
     class_counts = Counter(classes)
 
@@ -308,25 +297,26 @@ def main():
             faculty[i].append((day+12, day+25))
 
     # dummy course table
-    courses = []
+    course_table = []
     faculty_assigned = 0
-    for name in class_counts:
-        for sec in range(1, class_counts[name]+1):
+    for course_name in class_counts.keys():
+        for section in range(1, class_counts[course_name]+1):
             course = {
-                'name': name,
-                'section': sec,
+                'name': course_name,
+                'section': section,
                 'length': 6,
-                'split': 1,
+                'twice_a_week': True,
                 'faculty': faculty_assigned // 3,  # three classes per teacher
+                'restrictions': [p for p in programs if course_name.startswith(p)],
             }
             if random.random() < 0.2:
-                course['split'] = 0
-            courses.append(course)
+                course['twice_a_week'] = False
+            course_table.append(course)
             faculty_assigned += 1
 
     # dummy room list
     # if a room can hold 5 classes per day, we need 1 room for every 25 classes
-    rooms = tuple(range(math.ceil(len(classes) / 25)))
+    rooms = tuple(range(math.ceil(len(classes) * 1.8 / 25)))
 
     # check if faculty have enough contiguous blocks for each class
     for name in faculty:
@@ -336,8 +326,8 @@ def main():
         avail_length.sort()
 
         class_length = []
-        for course in [x for x in courses if x['faculty'] == name]:
-            if course['split'] == 1:
+        for course in [x for x in course_table if x['faculty'] == name]:
+            if course['twice_a_week'] == 1:
                 class_length.append(course['length'] // 2)
                 class_length.append(course['length'] // 2)
             else:
@@ -360,7 +350,7 @@ def main():
     creator.create("Individual", list, fitness=creator.Fitness)
 
     toolbox = base.Toolbox()
-    toolbox.register("ind", gen_ind, courses=courses, rooms=rooms, faculty=faculty)
+    toolbox.register("ind", gen_ind, course_table=course_table, rooms=rooms, faculty=faculty)
     toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.ind)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
@@ -369,8 +359,7 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register("select", tools.selTournament, tournsize=2)
 
-    # 160 gens with this seed
-    gens = 200  # generations
+    gens = 320  # generations
     mu = 1000  # population size
     lambd = 1000  # offspring to create
     cxpb = 0.8  # crossover probability

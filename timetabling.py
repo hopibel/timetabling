@@ -1,7 +1,11 @@
 """Timetabling using a genetic algorithm"""
 
+import sys
+import pprint
+
+import copy
 import random
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, namedtuple
 import math
 import numpy
 from deap import algorithms, base, creator, tools
@@ -50,12 +54,25 @@ def gen_ind(course_table, rooms, faculty):
     return ind
 
 
-def eval_timetable(individual):
+def eval_timetable(individual, course_table, class_counts, program_sizes):
     """Calculate timetable cost.
 
-    Currently returns:
+    Currently calculates:
     Number of overlapping classes
+    Excess classes in a timeslot (overallocation)
     """
+
+    print("Course table")
+    pprint.pprint(course_table)
+
+    print("\nClass counts")
+    pprint.pprint(class_counts)
+
+    print("\nProgram sizes")
+    pprint.pprint(program_sizes)
+
+    sys.exit()
+
     overlap = 0
 
     times = []
@@ -64,6 +81,7 @@ def eval_timetable(individual):
             times.append(session)
     times.sort(key=lambda x: x['slot'])
 
+    # the time covered by two classes must be at least equal to their combined duration to avoid overlaps
     for i, _ in enumerate(times):
         a = times[i]
         for j in range(i + 1, len(times)):
@@ -76,7 +94,60 @@ def eval_timetable(individual):
             if width < a['len'] + b['len']:
                 overlap += a['len'] + b['len'] - width
 
-    return (overlap,)
+    # TODO: write efficient data classes
+    overallocation = 0
+    for slot in range(SLOTS):
+        # find classes sharing this timeslot
+        classes = []
+        for course in individual:
+            for session in course:
+                if slot >= session['slot'] and slot < session['slot'] + session['len']:
+                    classes.append(session)
+
+        # sort by restrictions to ensure most restricted are allocated first
+        def count_allowed(course_name, course_table):
+            course = next(course for course in course_table if course['name'] == course_name)
+
+            # we want classes with no restrictions to be last in the list
+            if not course['restrictions']:
+                return float('inf')
+
+            allowed = 0
+            for restriction in course['restrictions']:
+                if restriction.year is not None:
+                    allowed += 4
+                else:
+                    allowed += 1
+
+            return allowed
+        classes.sort(key=lambda x: count_allowed(x['name'], course_table))
+
+        # TODO: take class size/capacity into account
+        # TODO: only check programs whose study plan contains one of the classes. needs access to study plans
+        for section in classes:
+            overallocation += 1
+        program_capacities = copy.deepcopy(program_sizes)
+        for section in classes:
+            # allocate program size to classes from most to least restricted. unused class capacity gets penalized
+            restrictions = next(course for course in course_table if course['name'] == section['name'])['restrictions']
+            for restriction in restrictions:
+                if restriction.year is not None:
+                    restriction_name = '{}-{}'.format(restriction.program, restriction.year)
+                else:
+                    restriction_name = restriction.program
+
+                if section['name'].startswith(restriction_name) and program_capacities[restriction_name] > 0:
+                    program_capacities[restriction_name] -= 1
+                    overallocation -= 1
+                    break
+            else:
+                for program, size in program_capacities.items():
+                    if size > 0:
+                        program_capacities[program] -= 1
+                        overallocation -= 1
+                        break
+
+    return (overlap + overallocation,)
 
 
 def mut_timetable(ind, rooms, faculty):
@@ -281,6 +352,11 @@ def main():
     programs = ['CS', 'Bio', 'Stat']
     plans = plan_gen.generate_study_plans(programs)
 
+    program_sizes = {}
+    for program, years in plans.items():
+        for year in years:
+            program_sizes['{}-{}'.format(program, year)] = 1
+
     classes = []
     for course in plans.values():
         for year in course.values():
@@ -298,16 +374,25 @@ def main():
 
     # dummy course table
     course_table = []
+    restriction = namedtuple('restriction', ['program', 'year'])
     faculty_assigned = 0
     for course_name in class_counts.keys():
         for section in range(1, class_counts[course_name]+1):
+            # store restrictions as list of namedtuples with program and year
+            # setting program or year to None acts as wildcard
+            restrictions = []
+            year = int(course_name[course_name.index('-')+1])
+            for p in programs:
+                if course_name.startswith(p):
+                    restrictions.append(restriction(program=p, year=year))
+
             course = {
                 'name': course_name,
                 'section': section,
                 'length': 6,
                 'twice_a_week': True,
                 'faculty': faculty_assigned // 3,  # three classes per teacher
-                'restrictions': [p for p in programs if course_name.startswith(p)],
+                'restrictions': restrictions,
             }
             if random.random() < 0.2:
                 course['twice_a_week'] = False
@@ -354,7 +439,7 @@ def main():
     toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.ind)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-    toolbox.register("evaluate", eval_timetable)
+    toolbox.register("evaluate", eval_timetable, course_table=course_table, class_counts=class_counts, program_sizes=program_sizes)
     toolbox.register("mate", tools.cxOnePoint)
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register("select", tools.selTournament, tournsize=2)

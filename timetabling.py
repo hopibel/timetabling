@@ -54,24 +54,13 @@ def gen_ind(course_table, rooms, faculty):
     return ind
 
 
-def eval_timetable(individual, course_table, class_counts, program_sizes):
+def eval_timetable(individual, course_table, class_counts, program_sizes, study_plans):
     """Calculate timetable cost.
 
     Currently calculates:
     Number of overlapping classes
     Excess classes in a timeslot (overallocation)
     """
-
-    print("Course table")
-    pprint.pprint(course_table)
-
-    print("\nClass counts")
-    pprint.pprint(class_counts)
-
-    print("\nProgram sizes")
-    pprint.pprint(program_sizes)
-
-    sys.exit()
 
     overlap = 0
 
@@ -95,6 +84,7 @@ def eval_timetable(individual, course_table, class_counts, program_sizes):
                 overlap += a['len'] + b['len'] - width
 
     # TODO: write efficient data classes
+    # A lot of list lookups happening here for static information. data structures *must* be faster than this
     overallocation = 0
     for slot in range(SLOTS):
         # find classes sharing this timeslot
@@ -106,6 +96,10 @@ def eval_timetable(individual, course_table, class_counts, program_sizes):
 
         # sort by restrictions to ensure most restricted are allocated first
         def count_allowed(course_name, course_table):
+            """
+            Count the number of groups allowed to take a course.
+            Returns infinity for no restrictions
+            """
             course = next(course for course in course_table if course['name'] == course_name)
 
             # we want classes with no restrictions to be last in the list
@@ -123,10 +117,27 @@ def eval_timetable(individual, course_table, class_counts, program_sizes):
         classes.sort(key=lambda x: count_allowed(x['name'], course_table))
 
         # TODO: take class size/capacity into account
-        # TODO: only check programs whose study plan contains one of the classes. needs access to study plans
+        program_capacities = {}
         for section in classes:
+            # assume all are overallocated and subtract later
             overallocation += 1
-        program_capacities = copy.deepcopy(program_sizes)
+
+            course = next(course for course in course_table if course['name'] == section['name'])
+
+            for restriction in course['restrictions']:
+                # add only programs/years that can take this course
+                if restriction.year is not None:
+                    key = '{}-{}'.format(*restriction)
+                    program_capacities[key] = program_sizes[key]
+                else:
+                    for key, count in program_sizes.items():
+                        if key.startswith('{}-'.format(restriction.program)):
+                            program_capacities[key] = count
+
+            if not course['restrictions']:
+                # no restrictions. add everything
+                program_capacities = copy.deepcopy(program_sizes)
+
         for section in classes:
             # allocate program size to classes from most to least restricted. unused class capacity gets penalized
             restrictions = next(course for course in course_table if course['name'] == section['name'])['restrictions']
@@ -439,7 +450,8 @@ def main():
     toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.ind)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-    toolbox.register("evaluate", eval_timetable, course_table=course_table, class_counts=class_counts, program_sizes=program_sizes)
+    toolbox.register("evaluate", eval_timetable, course_table=course_table, class_counts=class_counts,
+                     program_sizes=program_sizes, study_plans=plans)
     toolbox.register("mate", tools.cxOnePoint)
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register("select", tools.selTournament, tournsize=2)

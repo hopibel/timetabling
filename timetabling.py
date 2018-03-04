@@ -166,7 +166,7 @@ def mut_timetable(ind, rooms, faculty):
 
     Shift a class timeslot by 1
     Change classrooms
-    Toggle twice a week status
+    Swap two timeslots
     """
     i = random.randrange(len(ind))
     course = ind[i]
@@ -237,10 +237,15 @@ def mut_timetable(ind, rooms, faculty):
         for sess in course:
             sess['room'] = room
 
-    # TODO: add a swap mutation (slot or room)
+    def swap_slot():
+        """Swap a session's timeslot with another's."""
+        # pick a second session
+        course_b = ind[random.randrange(len(ind))]
+        session_b = random.choice(course_b)
+        session['slot'], session_b['slot'] = session_b['slot'], session['slot']
 
     # call a random mutator
-    muts = [shift_slot, change_room]
+    muts = [shift_slot, change_room, swap_slot]
     random.choice(muts)()
 
     return (ind,)
@@ -456,7 +461,7 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register("select", tools.selTournament, tournsize=2)
 
-    gens = 320  # generations
+    gens = 100  # generations
     mu = 1000  # population size
     lambd = 1000  # offspring to create
     cxpb = 0.8  # crossover probability

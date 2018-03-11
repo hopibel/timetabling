@@ -15,6 +15,35 @@ DAY_SLOTS = 28
 SLOTS = DAY_SLOTS * 5
 
 
+# TODO: instructor class
+class Session(object):
+    """Details of a scheduled session for a course."""
+
+    def __init__(self, course, timeslot, length, room, instructor, block):  # TODO: calculate block internally
+        self.name = course['name']
+        self.section = course['section']
+        self.timeslot = timeslot
+        self.length = length
+        self.room = room
+        self.instructor = instructor
+        self.block = block
+
+    def can_overlap(self, session):
+        """Check whether session has the same room or instructor."""
+        return self.room == session.room or self.instructor == session.instructor
+
+    def calculate_overlap(self, session):
+        """Calculate extent of overlap with another session."""
+        if not self.can_overlap(session):
+            return 0
+        if session.timeslot >= self.timeslot + self.length:  # no time overlap
+            return 0
+
+        # overlap = minimum width required - actual width
+        width = max(self.timeslot+self.length, session.timeslot+session.length) - min(self.timeslot, session.timeslot)
+        return self.length + session.length - width
+
+
 def gen_ind(course_table, rooms, faculty):
     """Generate individual."""
     ind = []
@@ -40,15 +69,7 @@ def gen_ind(course_table, rooms, faculty):
             i = random.choice(blocks)
             start, end = faculty[prof][i]
             slot = random.randrange(start, end+1 - length)
-            sessions.append({
-                'name': course['name'],
-                'section': course['section'],
-                'slot': slot,
-                'len': length,
-                'room': room,
-                'prof': prof,
-                'block': i,
-            })
+            sessions.append(Session(course, slot, length, room, prof, i))
         ind.append(sessions)
 
     return ind
@@ -68,20 +89,19 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
     for course in individual:
         for session in course:
             times.append(session)
-    times.sort(key=lambda x: x['slot'])
+    times.sort(key=lambda x: x.timeslot)
 
     # the time covered by two classes must be at least equal to their combined duration to avoid overlaps
     for i, _ in enumerate(times):
         a = times[i]
         for j in range(i + 1, len(times)):
             b = times[j]
-            if a['room'] != b['room'] and a['prof'] != b['prof']:
-                continue
-            if b['slot'] >= a['slot'] + a['len']:  # b and everything after don't overlap with a
-                break
-            width = max(a['slot']+a['len'], b['slot']+b['len']) - min(a['slot'], b['slot'])
-            if width < a['len'] + b['len']:
-                overlap += a['len'] + b['len'] - width
+            if a.can_overlap(b):
+                ab_overlap = a.calculate_overlap(b)
+                if ab_overlap == 0:  # b and everything afterwards don't overlap with a. break early
+                    break
+                else:
+                    overlap += ab_overlap
 
     # TODO: write efficient data classes
     # A lot of list lookups happening here for static information. data structures *must* be faster than this
@@ -91,7 +111,7 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
         classes = []
         for course in individual:
             for session in course:
-                if slot >= session['slot'] and slot < session['slot'] + session['len']:
+                if slot >= session.timeslot and slot < session.timeslot + session.length:
                     classes.append(session)
 
         # sort by restrictions to ensure most restricted are allocated first
@@ -114,7 +134,7 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
                     allowed += 1
 
             return allowed
-        classes.sort(key=lambda x: count_allowed(x['name'], course_table))
+        classes.sort(key=lambda x: count_allowed(x.name, course_table))
 
         # TODO: take class size/capacity into account
         program_capacities = {}
@@ -122,7 +142,7 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
             # assume all are overallocated and subtract later
             overallocation += 1
 
-            course = next(course for course in course_table if course['name'] == section['name'])
+            course = next(course for course in course_table if course['name'] == section.name)
 
             for restriction in course['restrictions']:
                 # add only programs/years that can take this course
@@ -140,14 +160,14 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
 
         for section in classes:
             # allocate program size to classes from most to least restricted. unused class capacity gets penalized
-            restrictions = next(course for course in course_table if course['name'] == section['name'])['restrictions']
+            restrictions = next(course for course in course_table if course['name'] == section.name)['restrictions']
             for restriction in restrictions:
                 if restriction.year is not None:
                     restriction_name = '{}-{}'.format(restriction.program, restriction.year)
                 else:
                     restriction_name = restriction.program
 
-                if section['name'].startswith(restriction_name) and program_capacities[restriction_name] > 0:
+                if section.name.startswith(restriction_name) and program_capacities[restriction_name] > 0:
                     program_capacities[restriction_name] -= 1
                     overallocation -= 1
                     break
@@ -178,38 +198,38 @@ def mut_timetable(ind, rooms, faculty):
         # assume we already confirmed that availability >= load
         shift = random.choice((1, -1))
 
-        blocks = faculty[session['prof']]
+        blocks = faculty[session.instructor]
 
         # bounds checking
         # if moving one way goes out of bounds, move the other way
-        before_first = session['slot'] + shift < 0
-        after_last = session['slot'] + session['len'] + shift > SLOTS
+        before_first = session.timeslot + shift < 0
+        after_last = session.timeslot + session.length + shift > SLOTS
         if before_first or after_last:
             shift = -shift
 
         def move_session():
             """Move a class session in the shift direction."""
-            before_block = session['slot'] + shift < blocks[session['block']][0]
-            after_block = session['slot'] + session['len']-1 + shift > blocks[session['block']][1]
+            before_block = session.timeslot + shift < blocks[session.block][0]
+            after_block = session.timeslot + session.length-1 + shift > blocks[session.block][1]
 
             if before_block or after_block:
                 # leaving block. is there a suitable adjacent one?
                 if shift > 0:
-                    block_range = range(session['block']+1, len(blocks))
+                    block_range = range(session.block+1, len(blocks))
                 else:
-                    block_range = range(session['block']-1, -1, -1)
+                    block_range = range(session.block-1, -1, -1)
 
                 for i in block_range:
-                    if blocks[i][1]+1 - blocks[i][0] >= session['len']:
+                    if blocks[i][1]+1 - blocks[i][0] >= session.length:
                         if shift > 0:
-                            session['slot'] = blocks[i][0]
+                            session.timeslot = blocks[i][0]
                         else:
-                            session['slot'] = blocks[i][1]+1 - session['len']
-                        session['block'] = i
+                            session.timeslot = blocks[i][1]+1 - session.length
+                        session.block = i
                         return True
                 return False
             else:
-                session['slot'] += shift
+                session.timeslot += shift
             return True
 
         if not move_session():
@@ -235,14 +255,14 @@ def mut_timetable(ind, rooms, faculty):
         """Change a course's room assignment."""
         room = random.choice(rooms)
         for sess in course:
-            sess['room'] = room
+            sess.room = room
 
     def swap_slot():
         """Swap a session's timeslot with another's."""
         # pick a second session
         course_b = ind[random.randrange(len(ind))]
         session_b = random.choice(course_b)
-        session['slot'], session_b['slot'] = session_b['slot'], session['slot']
+        session.timeslot, session_b.timeslot = session_b.timeslot, session.timeslot
 
     # call a random mutator
     muts = [shift_slot, change_room, swap_slot]
@@ -256,10 +276,10 @@ def to_html(ind):
     rooms = defaultdict(list)
     for course in ind:
         for session in course:
-            rooms[session['room']].append({
-                'name': "{}-{}".format(session['name'], session['section']),
-                'start': session['slot'],
-                'end': session['slot'] + session['len'] - 1,
+            rooms[session.room].append({
+                'name': "{}-{}".format(session.name, session.section),
+                'start': session.timeslot,
+                'end': session.timeslot + session.length - 1,
             })
 
     tables = {}
@@ -416,8 +436,9 @@ def main():
             faculty_assigned += 1
 
     # dummy room list
-    # if a room can hold 5 classes per day, we need 1 room for every 25 classes
-    rooms = tuple(range(math.ceil(len(classes) * 1.8 / 25)))
+    # if a room can hold 0 classes per day, we need 1 room for every 20 classes
+    # i have no idea what the 1.8 is for. probably to account for double-length classes
+    rooms = tuple(range(math.ceil(len(classes) * 1.8 / 20)))
 
     # check if faculty have enough contiguous blocks for each class
     for name in faculty:

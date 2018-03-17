@@ -3,7 +3,6 @@
 import sys
 import pprint
 
-import copy
 import random
 from collections import defaultdict, Counter, namedtuple
 import math
@@ -15,22 +14,98 @@ DAY_SLOTS = 28
 SLOTS = DAY_SLOTS * 5
 
 
+class Instructor(object):
+    """Details and availability of instructor."""
+    def __init__(self, name, avail):
+        self.name = name
+        self.avail = avail
+
+    def valid_blocks(self, length):
+        """Return indexes of availability blocks of a minimum length."""
+        return [i for i, r in enumerate(self.avail) if r[1]-r[0]+1 >= length]
+
+    def next_valid_block(self, index, length, reverse=False):
+        """Return next block of given minimum length in the specified direction."""
+        if not reverse:
+            block_range = range(index + 1, len(self.avail))
+        else:
+            block_range = range(index - 1, -1, -1)
+
+        for block_index in block_range:
+            if self.avail[block_index][1]+1 - self.avail[block_index][0] >= length:
+                return block_index
+
+        raise ValueError("No blocks fulfill minimum length found.")
+
+
+class Course(object):
+    """Course object for identification purposes in study plans and restrictions."""
+    def __init__(self, name=None):
+        self.name = name
+
+    def matches(self, course):
+        """Check whether this course fulfills the given course requirement."""
+        return self.name == course.name
+
+    @staticmethod
+    def is_wildcard():
+        """Return whether this a wildcard."""
+        return False
+
+    def __hash__(self):
+        return hash((self.name, self.is_wildcard()))
+
+    def __eq__(self, other):
+        return self.name == other.name and self.is_wildcard() == other.is_wildcard()
+
+
+class WildcardCourse(Course):
+    """
+    Wildcard course for GEs and Electives. Matches any GE or elective in a study plan.
+
+    All GE types and Electives are treated as one category.
+    GEs are numerous enough that mutual exclusion is unlikely.
+    Electives often have restrictions which take effect before wildcards.
+    """
+    def matches(self, course):
+        return course.is_wildcard() or self.name == course.name
+
+    @staticmethod
+    def is_wildcard():
+        return True
+
+
+class Section(object):
+    """Specific section from a Course used to build course table and schedule."""
+    def __init__(self, course, id_, instructor, length, restrictions, twice_a_week):
+        """
+        course (Course): Course that this Section belongs to
+        id_ (hashable): section ID
+        instructor (Instructor): Instructor details
+        twice_a_week (bool): whether the section is split into two weekly sessions
+        """
+        self.course = course
+        self.id_ = id_
+        self.instructor = instructor
+        self.length = length
+        self.restrictions = restrictions
+        self.twice_a_week = twice_a_week
+
+
 # TODO: instructor class
-class Session(object):
+class SessionSchedule(object):
     """Details of a scheduled session for a course."""
 
-    def __init__(self, course, timeslot, length, room, instructor, block):  # TODO: calculate block internally
-        self.name = course['name']
-        self.section = course['section']
+    def __init__(self, section, timeslot, length, room, block):  # TODO: calculate block internally
+        self.section = section
         self.timeslot = timeslot
         self.length = length
         self.room = room
-        self.instructor = instructor
         self.block = block
 
     def can_overlap(self, session):
         """Check whether session has the same room or instructor."""
-        return self.room == session.room or self.instructor == session.instructor
+        return self.room == session.room or self.section.instructor == session.section.instructor
 
     def calculate_overlap(self, session):
         """Calculate extent of overlap with another session."""
@@ -47,34 +122,35 @@ class Session(object):
 def gen_ind(course_table, rooms, faculty):
     """Generate individual."""
     ind = []
-    for course in course_table:
-        prof = course['faculty']
-
-        length = course['length']
+    for section in course_table:
+        length = section.length
         room = random.choice(rooms)
         meetings = 1
 
         if length % 2 != 0:
-            raise ValueError("Splittable class '{}' has odd length".format(course['name']))
+            raise ValueError("Splittable class '{}' has odd length".format(section.course['name']))
 
-        if course['twice_a_week']:
+        if section.twice_a_week:
             length //= 2
             meetings = 2
 
         # indexes of availability blocks large enough to hold this class
-        blocks = [i for i, r in enumerate(faculty[prof]) if r[1]-r[0]+1 >= length]
+        blocks = section.instructor.valid_blocks(length)
 
         sessions = []
         for _ in range(meetings):
             i = random.choice(blocks)
-            start, end = faculty[prof][i]
+            start, end = section.instructor.avail[i]
             slot = random.randrange(start, end+1 - length)
-            sessions.append(Session(course, slot, length, room, prof, i))
+            sessions.append(SessionSchedule(section, slot, length, room, i))
         ind.append(sessions)
 
     return ind
 
 
+# TODO: apparently i'm not using class_counts and study_plans at all. uh oh
+# treat all GEs and electives as one category. GEs are numerous enough that there will usually be an available class.
+# electives are often course specific so they're covered by restrictions already
 def eval_timetable(individual, course_table, class_counts, program_sizes, study_plans):
     """Calculate timetable cost.
 
@@ -120,61 +196,56 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
             Count the number of groups allowed to take a course.
             Returns infinity for no restrictions
             """
-            course = next(course for course in course_table if course['name'] == course_name)
+            course = next(course for course in course_table if course.course.name == course_name)
 
             # we want classes with no restrictions to be last in the list
-            if not course['restrictions']:
+            if not course.restrictions:
                 return float('inf')
 
             allowed = 0
-            for restriction in course['restrictions']:
+            for restriction in course.restrictions:
                 if restriction.year is not None:
                     allowed += 4
                 else:
                     allowed += 1
 
             return allowed
-        classes.sort(key=lambda x: count_allowed(x.name, course_table))
+        classes.sort(key=lambda x: count_allowed(x.section.course.name, course_table))
 
         # TODO: take class size/capacity into account
         program_capacities = {}
-        for section in classes:
+        for schedule in classes:
             # assume all are overallocated and subtract later
             overallocation += 1
 
-            course = next(course for course in course_table if course['name'] == section.name)
-
-            for restriction in course['restrictions']:
-                # add only programs/years that can take this course
+            # add only programs/years that have this course in their study plan
+            # add only programs/years that can take this course
+            for restriction in schedule.section.restrictions:
                 if restriction.year is not None:
-                    key = '{}-{}'.format(*restriction)
-                    program_capacities[key] = program_sizes[key]
+                    program_year = (restriction.program, restriction.year)
+                    program_capacities[program_year] = program_sizes[program_year]
                 else:
-                    for key, count in program_sizes.items():
-                        if key.startswith('{}-'.format(restriction.program)):
-                            program_capacities[key] = count
+                    for program_year, count in program_sizes.items():
+                        if program_year[0] == restriction.program:
+                            program_capacities[program_year] = count
 
-            if not course['restrictions']:
+            if not schedule.section.restrictions:
                 # no restrictions. add everything
-                program_capacities = copy.deepcopy(program_sizes)
+                for program_year, count in program_sizes.items():
+                    program_capacities[program_year] = count
 
-        for section in classes:
+        for schedule in classes:
             # allocate program size to classes from most to least restricted. unused class capacity gets penalized
-            restrictions = next(course for course in course_table if course['name'] == section.name)['restrictions']
-            for restriction in restrictions:
-                if restriction.year is not None:
-                    restriction_name = '{}-{}'.format(restriction.program, restriction.year)
-                else:
-                    restriction_name = restriction.program
-
-                if section.name.startswith(restriction_name) and program_capacities[restriction_name] > 0:
-                    program_capacities[restriction_name] -= 1
+            for restriction in schedule.section.restrictions:
+                if program_capacities[restriction] > 0:
+                    program_capacities[restriction] -= 1
                     overallocation -= 1
                     break
-            else:
-                for program, size in program_capacities.items():
+
+            if not schedule.section.restrictions:
+                for program_year, size in program_capacities.items():
                     if size > 0:
-                        program_capacities[program] -= 1
+                        program_capacities[program_year] -= 1
                         overallocation -= 1
                         break
 
@@ -198,7 +269,7 @@ def mut_timetable(ind, rooms, faculty):
         # assume we already confirmed that availability >= load
         shift = random.choice((1, -1))
 
-        blocks = faculty[session.instructor]
+        blocks = session.section.instructor.avail
 
         # bounds checking
         # if moving one way goes out of bounds, move the other way
@@ -207,7 +278,7 @@ def mut_timetable(ind, rooms, faculty):
         if before_first or after_last:
             shift = -shift
 
-        def move_session():
+        def move_session(shift):
             """Move a class session in the shift direction."""
             before_block = session.timeslot + shift < blocks[session.block][0]
             after_block = session.timeslot + session.length-1 + shift > blocks[session.block][1]
@@ -215,27 +286,22 @@ def mut_timetable(ind, rooms, faculty):
             if before_block or after_block:
                 # leaving block. is there a suitable adjacent one?
                 if shift > 0:
-                    block_range = range(session.block+1, len(blocks))
+                    session.block = session.section.instructor.next_valid_block(session.block, session.length)
+                    session.timeslot = blocks[session.block][0]
                 else:
-                    block_range = range(session.block-1, -1, -1)
-
-                for i in block_range:
-                    if blocks[i][1]+1 - blocks[i][0] >= session.length:
-                        if shift > 0:
-                            session.timeslot = blocks[i][0]
-                        else:
-                            session.timeslot = blocks[i][1]+1 - session.length
-                        session.block = i
-                        return True
-                return False
+                    session.block = session.section.instructor.next_valid_block(session.block, session.length, True)
+                    session.timeslot = blocks[session.block][1] + 1 - session.length
             else:
                 session.timeslot += shift
-            return True
 
-        if not move_session():
-            # try the other direction
-            shift = -shift
-            move_session()
+        # try to shift in the given direction, otherwise try the opposite
+        try:
+            move_session(shift)
+        except ValueError:
+            try:
+                move_session(-shift)
+            except ValueError:
+                pass
 
         # day boundary checking
         # fully move across boundary
@@ -277,7 +343,7 @@ def to_html(ind):
     for course in ind:
         for session in course:
             rooms[session.room].append({
-                'name': "{}-{}".format(session.name, session.section),
+                'name': "{}-{}".format(session.section.course.name, session.section.id_),
                 'start': session.timeslot,
                 'end': session.timeslot + session.length - 1,
             })
@@ -389,14 +455,12 @@ def main():
     plans = plan_gen.generate_study_plans(programs)
 
     program_sizes = {}
-    for program, years in plans.items():
-        for year in years:
-            program_sizes['{}-{}'.format(program, year)] = 1
+    for program_year in plans:
+        program_sizes[program_year] = 1
 
     classes = []
     for course in plans.values():
-        for year in course.values():
-            classes.extend(year)
+        classes.extend(course)
     class_counts = Counter(classes)
 
     # dummy faculty availability
@@ -408,59 +472,63 @@ def main():
             faculty[i].append((day, day+10))
             faculty[i].append((day+12, day+25))
 
+    # generate teachers with availability of 20 timeslots per day split into morning and afternoon
+    # TODO: sanity check that no availability crosses a day boundary
+    # possibly implemented as a db constraint rather than here
+    faculty = []
+    for i in range(math.ceil(len(classes) / 3)):
+        blocks = []
+        for day in range(5):
+            day *= DAY_SLOTS
+            blocks.append((day, day + 10))
+            blocks.append((day + 12, day + 25))
+        faculty.append(Instructor(name=i, avail=blocks))
+
     # dummy course table
     course_table = []
     restriction = namedtuple('restriction', ['program', 'year'])
     faculty_assigned = 0
-    for course_name in class_counts.keys():
-        for section in range(1, class_counts[course_name]+1):
+    for course in class_counts.keys():
+        for section_number in range(1, class_counts[course]+1):
             # store restrictions as list of namedtuples with program and year
             # setting program or year to None acts as wildcard
             restrictions = []
-            year = int(course_name[course_name.index('-')+1])
+            year = int(course.name[course.name.index('-')+1])
             for p in programs:
-                if course_name.startswith(p):
+                if course.name.startswith(p):
                     restrictions.append(restriction(program=p, year=year))
 
-            course = {
-                'name': course_name,
-                'section': section,
-                'length': 6,
-                'twice_a_week': True,
-                'faculty': faculty_assigned // 3,  # three classes per teacher
-                'restrictions': restrictions,
-            }
-            if random.random() < 0.2:
-                course['twice_a_week'] = False
-            course_table.append(course)
+            twice_a_week = random.random() > 0.2
+            section = Section(course, section_number, faculty[faculty_assigned // 3], 6, restrictions, twice_a_week)
+            course_table.append(section)
             faculty_assigned += 1
 
     # dummy room list
-    # if a room can hold 0 classes per day, we need 1 room for every 20 classes
+    # if a room can hold 4 classes per day, we need 1 room for every 20 classes
     # i have no idea what the 1.8 is for. probably to account for double-length classes
     rooms = tuple(range(math.ceil(len(classes) * 1.8 / 20)))
 
     # check if faculty have enough contiguous blocks for each class
-    for name in faculty:
+    for instructor in faculty:
         avail_length = []
-        for block in faculty[name]:
+        for block in instructor.avail:
             avail_length.append(block[1] - block[0] + 1)
         avail_length.sort()
 
         class_length = []
-        for course in [x for x in course_table if x['faculty'] == name]:
-            if course['twice_a_week'] == 1:
-                class_length.append(course['length'] // 2)
-                class_length.append(course['length'] // 2)
+        for course in [x for x in course_table if x.instructor.name == instructor.name]:
+            if course.twice_a_week:
+                class_length.append(course.length // 2)
+                class_length.append(course.length // 2)
             else:
-                class_length.append(course['length'])
+                class_length.append(course.length)
         class_length.sort()
 
         i = 0
         j = 0
         while i < len(class_length):
             if j >= len(avail_length):
-                raise ValueError("Faculty member {} can't teach all their classes".format(name))
+                raise ValueError("Faculty member {} can't teach all their classes".format(instructor.name))
 
             if avail_length[j] >= class_length[i]:
                 avail_length[j] -= class_length[i]
@@ -482,9 +550,9 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register("select", tools.selTournament, tournsize=2)
 
-    gens = 100  # generations
-    mu = 1000  # population size
-    lambd = 1000  # offspring to create
+    gens = 10  # generations
+    mu = 100  # population size
+    lambd = mu  # offspring to create
     cxpb = 0.8  # crossover probability
     mutpb = 0.2  # mutation probability
 

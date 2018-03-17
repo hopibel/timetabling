@@ -92,7 +92,6 @@ class Section(object):
         self.twice_a_week = twice_a_week
 
 
-# TODO: instructor class
 class SessionSchedule(object):
     """Details of a scheduled session for a course."""
 
@@ -130,6 +129,7 @@ def gen_ind(course_table, rooms, faculty):
         if length % 2 != 0:
             raise ValueError("Splittable class '{}' has odd length".format(section.course['name']))
 
+        # TODO: sync meetings
         if section.twice_a_week:
             length //= 2
             meetings = 2
@@ -179,8 +179,6 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
                 else:
                     overlap += ab_overlap
 
-    # TODO: write efficient data classes
-    # A lot of list lookups happening here for static information. data structures *must* be faster than this
     overallocation = 0
     for slot in range(SLOTS):
         # find classes sharing this timeslot
@@ -218,8 +216,7 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
             # assume all are overallocated and subtract later
             overallocation += 1
 
-            # add only programs/years that have this course in their study plan
-            # add only programs/years that can take this course
+            # add programs/years that this course is restricted to
             for restriction in schedule.section.restrictions:
                 if restriction.year is not None:
                     program_year = (restriction.program, restriction.year)
@@ -229,10 +226,13 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
                         if program_year[0] == restriction.program:
                             program_capacities[program_year] = count
 
+            # no restrictions. add all programs/years with this course in their study plan
             if not schedule.section.restrictions:
-                # no restrictions. add everything
-                for program_year, count in program_sizes.items():
-                    program_capacities[program_year] = count
+                for program_year, plan in study_plans.items():
+                    for course in plan:
+                        if schedule.section.course.matches(course):
+                            program_capacities[program_year] = program_sizes[program_year]
+                            break
 
         for schedule in classes:
             # allocate program size to classes from most to least restricted. unused class capacity gets penalized
@@ -452,6 +452,7 @@ def main():
 
     # dummy study plans (only used to generate classes right now)
     programs = ['CS', 'Bio', 'Stat']
+    programs = ['CS', 'Bio']
     plans = plan_gen.generate_study_plans(programs)
 
     program_sizes = {}
@@ -550,8 +551,8 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register("select", tools.selTournament, tournsize=2)
 
-    gens = 10  # generations
-    mu = 100  # population size
+    gens = 150  # generations
+    mu = 300  # population size
     lambd = mu  # offspring to create
     cxpb = 0.8  # crossover probability
     mutpb = 0.2  # mutation probability

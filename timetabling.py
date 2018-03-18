@@ -9,6 +9,7 @@ import math
 import numpy
 from deap import algorithms, base, creator, tools
 import plan_gen
+import to_html
 
 DAY_SLOTS = 28
 SLOTS = DAY_SLOTS * 5
@@ -19,6 +20,22 @@ class Instructor(object):
     def __init__(self, name, avail):
         self.name = name
         self.avail = avail
+
+        # avail is always sorted and gaps are cached
+        self.avail.sort(key=lambda x: x[0])
+
+        self.gaps = {}
+        for i in range(5):
+            self.gaps[i] = set()
+
+        for i in range(len(self.avail) - 1):
+            a = self.avail[i]
+            b = self.avail[i + 1]
+
+            # check if same day
+            if a[0] // DAY_SLOTS == b[0] // DAY_SLOTS:
+                day = a[0] // DAY_SLOTS
+                self.gaps[day].update(range(a[-1] + 1, b[0]))
 
     def valid_blocks(self, length):
         """Return indexes of availability blocks of a minimum length."""
@@ -36,6 +53,12 @@ class Instructor(object):
                 return block_index
 
         raise ValueError("No blocks fulfill minimum length found.")
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return self.name == other.name
 
 
 class Course(object):
@@ -172,17 +195,15 @@ def gen_ind(course_table, rooms, faculty):
     return ind
 
 
-# TODO: apparently i'm not using class_counts and study_plans at all. uh oh
 # treat all GEs and electives as one category. GEs are numerous enough that there will usually be an available class.
 # electives are often course specific so they're covered by restrictions already
-def eval_timetable(individual, course_table, class_counts, program_sizes, study_plans):
+def eval_timetable(individual, course_table, program_sizes, study_plans):
     """Calculate timetable cost.
 
     Currently calculates:
     Number of overlapping classes
     Excess classes in a timeslot (overallocation)
     """
-
     overlap = 0
 
     times = []
@@ -273,7 +294,48 @@ def eval_timetable(individual, course_table, class_counts, program_sizes, study_
                         overallocation -= 1
                         break
 
-    return (overlap + overallocation,)
+    # soft constraint fitness
+    soft_score = soft_fitness(individual)
+
+    return (overlap + overallocation, soft_score)
+
+
+def soft_fitness(individual):
+    """
+    Calculate soft constraint fitness penalties.
+    Value is a single sum for simplicity.
+
+    Current constraints:
+    Minimize unused timeslots between classes per instructor.
+    """
+    # group sessions by instructor
+    instructors = {}
+    for course in individual:
+        if course[0].section.instructor not in instructors:
+            instructors[course[0].section.instructor] = []
+        for section in course:
+            instructors[section.section.instructor].append(section)
+
+    # count gaps between classes occurring on the same day
+    gap_length = 0
+    for instructor, sections in instructors.items():
+        # sort by timeslot
+        sections.sort(key=lambda x: x.timeslot)
+
+        for i in range(len(sections) - 1):
+            a = sections[i]
+            b = sections[i + 1]
+
+            # check if same day
+            # ignore gap if it is present in availability schedule already
+            if a.timeslot // DAY_SLOTS == b.timeslot // DAY_SLOTS:
+                gap = range(a.timeslot + a.length, b.timeslot)
+                day = a.timeslot // DAY_SLOTS
+
+                gap_length += len(gap)
+                gap_length -= len(instructor.gaps[day].intersection(gap))
+
+    return gap_length
 
 
 def mut_timetable(ind, rooms, faculty):
@@ -410,114 +472,6 @@ def mut_timetable(ind, rooms, faculty):
     return (ind,)
 
 
-def to_html(ind):
-    """Convert timetable to html table."""
-    rooms = defaultdict(list)
-    for course in ind:
-        for session in course:
-            rooms[session.room].append({
-                'name': "{}-{}".format(session.section.course.name, session.section.id_),
-                'start': session.timeslot,
-                'end': session.timeslot + session.length - 1,
-            })
-
-    tables = {}
-    for key, room in rooms.items():
-        points = []  # list of (offset, plus/minus, name) tuples
-        for course in room:
-            points.append((course['start'], '+', course['name']))
-            points.append((course['end'], '-', course['name']))
-        points.sort(key=lambda x: x[1])
-        points.sort(key=lambda x: x[0])
-
-        ranges = []  # output list of (start, stop, symbol_set) tuples
-        current_set = []
-        last_start = None
-        offset = points[0][0]
-        for offset, pm, name in points:
-            if pm == '+':
-                if last_start is not None and current_set and offset - last_start > 0:
-                    ranges.append((last_start, offset-1, current_set.copy()))
-                current_set.append(name)
-                last_start = offset
-            elif pm == '-':
-                if offset >= last_start:
-                    ranges.append((last_start, offset, current_set.copy()))
-                current_set.remove(name)
-                last_start = offset+1
-
-        cells = []
-        last_slot = 0
-        for r in ranges:  # ranges = list of (start, end, {names})
-            if r[0] > last_slot:
-                for i in range(last_slot, r[0]):
-                    cells.append((i, i, []))
-            cells.append(r)
-            last_slot = r[1] + 1
-        for i in range(last_slot+1, SLOTS):
-            cells.append((i, i, []))
-
-        rows = list([] for _ in range(DAY_SLOTS))
-        for cell in cells:
-            rows[cell[0] % DAY_SLOTS].append(cell)
-
-        table = []
-        table.append("<table>")
-        table.append("""
-<tr>
-<th>Time</th>
-<th>Monday</th>
-<th>Tuesday</th>
-<th>Wednesday</th>
-<th>Thursday</th>
-<th>Friday</th>
-</tr>
-"""[1:-1])
-        for i, row in enumerate(rows):
-            table.append("<tr>")
-            table.append("<td>{}</td>".format(str(600 + 100*(i//2) + (i % 2)*30).zfill(4)))
-            for cell in row:
-                if cell[2] == []:
-                    table.append("<td>&nbsp;</td>")
-                else:
-                    line = "<td"
-                    if cell[1] > cell[0]:
-                        line += " rowspan={}".format(cell[1] - cell[0] + 1)
-                    if len(cell[2]) > 1:
-                        line += " class=overlap"
-                    else:
-                        line += " class=course"
-                    line += ">"
-                    line += "<br>".join(str(x) for x in cell[2])
-                    line += "</td>"
-                    table.append(line)
-            table.append("</tr>")
-        table.append("</table>")
-        tables[key] = table
-
-    html = []
-    # boilerplate
-    html.append("""
-<head>
-<style>
-table { border-collapse: collapse; }
-table, th, td { border: 1px solid black; }
-td { text-align: center; }
-.overlap { background-color: orange; }
-.course { background-color: #93c572; }
-</style>
-</head>
-"""[1:-1])
-    for name, table in tables.items():
-        html.append("<b>Room {}</b><br>".format(name))
-        for line in table:
-            html.append(line)
-
-    with open('room_sched.html', 'w') as outfile:
-        for line in html:
-            outfile.write(line + "\n")
-
-
 def main():
     """Entry point if called as executable."""
 
@@ -569,9 +523,9 @@ def main():
             faculty_assigned += 1
 
     # dummy room list
-    # if a room can hold 4 classes per day, we need 1 room for every 20 classes
+    # if a room can hold 6 classes per day, we need 1 room for every 30 classes
     # i have no idea what the 1.8 is for. probably to account for double-length classes
-    rooms = tuple(range(math.ceil(len(classes) * 1.8 / 20)))
+    rooms = tuple(range(math.ceil(len(classes) * 1.8 / 30)))
 
     # check if faculty have enough contiguous blocks for each class
     for instructor in faculty:
@@ -601,7 +555,7 @@ def main():
             else:
                 j += 1
 
-    creator.create("Fitness", base.Fitness, weights=(-1.0,))
+    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0))  # minimize hard and soft constraint violations
     creator.create("Individual", list, fitness=creator.Fitness)
 
     toolbox = base.Toolbox()
@@ -609,16 +563,16 @@ def main():
     toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.ind)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-    toolbox.register("evaluate", eval_timetable, course_table=course_table, class_counts=class_counts,
-                     program_sizes=program_sizes, study_plans=plans)
+    toolbox.register("evaluate", eval_timetable,
+                     course_table=course_table, program_sizes=program_sizes, study_plans=plans)
     toolbox.register("mate", tools.cxOnePoint)
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
-    toolbox.register("select", tools.selTournament, tournsize=2)
+    toolbox.register('select', tools.selNSGA2)
 
     gens = 100  # generations
     mu = 100  # population size
-    lambd = mu  # offspring to create
-    cxpb = 0.8  # crossover probability
+    lambd = mu * 2  # offspring to create
+    cxpb = 0.7  # crossover probability
     mutpb = 0.2  # mutation probability
 
     pop = toolbox.population(n=mu)
@@ -632,7 +586,7 @@ def main():
     algorithms.eaMuPlusLambda(
         pop, toolbox, mu, lambd, cxpb, mutpb, gens, stats=stats, halloffame=hof, verbose=True)
 
-    to_html(hof[0])
+    to_html.to_html(hof[0], SLOTS, DAY_SLOTS)
 
 
 if __name__ == '__main__':

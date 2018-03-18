@@ -22,7 +22,7 @@ class Instructor(object):
 
     def valid_blocks(self, length):
         """Return indexes of availability blocks of a minimum length."""
-        return [i for i, r in enumerate(self.avail) if r[1]-r[0]+1 >= length]
+        return [i for i, r in enumerate(self.avail) if len(r) >= length]
 
     def next_valid_block(self, index, length, reverse=False):
         """Return next block of given minimum length in the specified direction."""
@@ -32,7 +32,7 @@ class Instructor(object):
             block_range = range(index - 1, -1, -1)
 
         for block_index in block_range:
-            if self.avail[block_index][1]+1 - self.avail[block_index][0] >= length:
+            if len(self.avail[block_index]) >= length:
                 return block_index
 
         raise ValueError("No blocks fulfill minimum length found.")
@@ -124,25 +124,49 @@ def gen_ind(course_table, rooms, faculty):
     for section in course_table:
         length = section.length
         room = random.choice(rooms)
-        meetings = 1
 
         if length % 2 != 0:
             raise ValueError("Splittable class '{}' has odd length".format(section.course['name']))
 
         # TODO: sync meetings
+        sessions = []
         if section.twice_a_week:
             length //= 2
-            meetings = 2
+            # indexes of availability blocks large enough to hold this class
+            blocks = section.instructor.valid_blocks(length)
+            first_blocks = [b for b in blocks if section.instructor.avail[b][0] < DAY_SLOTS * 2]
 
-        # indexes of availability blocks large enough to hold this class
-        blocks = section.instructor.valid_blocks(length)
+            # choose second blocks three days after a first block and overlap >= length
+            # filter out first blocks with no corresponding second
+            block_pairs = []
+            for first in first_blocks:
+                f = section.instructor.avail[first]
+                shifted = range(f[0] + DAY_SLOTS * 3, f[-1] + 1 + DAY_SLOTS * 3)
+                for b in blocks:
+                    if len(set(shifted).intersection(section.instructor.avail[b])) >= length:
+                        block_pairs.append((first, b))
+                        break
 
-        sessions = []
-        for _ in range(meetings):
+            pair = random.choice(block_pairs)
+            first = section.instructor.avail[pair[0]]
+            second = section.instructor.avail[pair[1]]
+
+            # pick a random block and schedule the second session at the same time 3 days later
+            start = max(first[0], second[0] - DAY_SLOTS * 3)
+            end = min(first[-1], second[-1] - DAY_SLOTS * 3)
+            slot = random.randrange(start, end + 1 - length)
+            sessions.append(SessionSchedule(section, slot, length, room, pair[0]))
+            sessions.append(SessionSchedule(section, slot + DAY_SLOTS * 3, length, room, pair[1]))
+        else:
+            # single session scheduling. no sync needed
+            blocks = section.instructor.valid_blocks(length)
+
             i = random.choice(blocks)
-            start, end = section.instructor.avail[i]
+            start = section.instructor.avail[i][0]
+            end = section.instructor.avail[i][-1]
             slot = random.randrange(start, end+1 - length)
             sessions.append(SessionSchedule(section, slot, length, room, i))
+
         ind.append(sessions)
 
     return ind
@@ -261,7 +285,6 @@ def mut_timetable(ind, rooms, faculty):
     """
     i = random.randrange(len(ind))
     course = ind[i]
-    session = random.choice(course)
 
     def shift_slot():
         """Shift class forward or back by one time slot."""
@@ -269,30 +292,87 @@ def mut_timetable(ind, rooms, faculty):
         # assume we already confirmed that availability >= load
         shift = random.choice((1, -1))
 
-        blocks = session.section.instructor.avail
+        blocks = course[0].section.instructor.avail
 
         # bounds checking
         # if moving one way goes out of bounds, move the other way
-        before_first = session.timeslot + shift < 0
-        after_last = session.timeslot + session.length + shift > SLOTS
+        before_first = False
+        after_last = False
+        for sess in course:
+            before_first = before_first or sess.timeslot + shift < 0
+            after_last = after_last or sess.timeslot + sess.length + shift > SLOTS
+
         if before_first or after_last:
             shift = -shift
 
         def move_session(shift):
-            """Move a class session in the shift direction."""
-            before_block = session.timeslot + shift < blocks[session.block][0]
-            after_block = session.timeslot + session.length-1 + shift > blocks[session.block][1]
+            """
+            Move a class session in the shift direction.
+            Throws ValueError when session cannot be shifted.
+            """
+            before_block = False
+            after_block = False
+            for sess in course:
+                before_block = before_block or sess.timeslot + shift < blocks[sess.block][0]
+                after_block = after_block or sess.timeslot + sess.length - 1 + shift > blocks[sess.block][-1]
 
+            instructor = course[0].section.instructor
+            length = course[0].section.length
+            assert len(course) == 1 or instructor == course[1].section.instructor
+            assert len(course) == 1 or length == course[1].section.length
             if before_block or after_block:
                 # leaving block. is there a suitable adjacent one?
-                if shift > 0:
-                    session.block = session.section.instructor.next_valid_block(session.block, session.length)
-                    session.timeslot = blocks[session.block][0]
-                else:
-                    session.block = session.section.instructor.next_valid_block(session.block, session.length, True)
-                    session.timeslot = blocks[session.block][1] + 1 - session.length
-            else:
-                session.timeslot += shift
+                reverse = shift < 0
+
+                if len(course) > 1:  # 2 sessions
+                    block_a = instructor.next_valid_block(course[0].block, length, reverse)
+                    block_b = instructor.next_valid_block(course[1].block, length, reverse)
+
+                    first_block = blocks[block_a]
+                    second_block = blocks[block_b]
+
+                    # advance blocks until a valid pair is found for MTh or TF
+                    while True:
+                        shifted = range(second_block[0] - DAY_SLOTS * 3, second_block[-1] + 1 - DAY_SLOTS * 3)
+                        if len(set(shifted).intersection(first_block)) < length:
+                            if not reverse:
+                                shift_first = first_block[0] < shifted[0]
+                            else:
+                                shift_first = first_block[-1] >= shifted[-1]
+
+                            if shift_first:
+                                block_a = instructor.next_valid_block(block_a, length, reverse)
+                                first_block = blocks[block_a]
+                            else:
+                                block_b = instructor.next_valid_block(block_b, length, reverse)
+                                second_block = blocks[block_b]
+                        else:
+                            break
+
+                    # assign new blocks and timeslots
+                    course[0].block = block_a
+                    course[1].block = block_b
+
+                    # get correct slot for direction
+                    if not reverse:
+                        slot = max(blocks[block_a][0], blocks[block_b][0] - DAY_SLOTS * 3)
+                    else:
+                        slot = min(blocks[block_a][-1], blocks[block_b][-1] - DAY_SLOTS * 3)
+                        slot = slot + 1 - length
+
+                    course[0].timeslot = slot
+                    course[1].timeslot = slot + DAY_SLOTS * 3
+                else:  # 1 session
+                    sess = course[0]
+                    sess.block = instructor.next_valid_block(sess.block, length, reverse)
+
+                    if not reverse:  # forward
+                        sess.timeslot = blocks[sess.block][0]
+                    else:  # backward
+                        sess.timeslot = blocks[sess.block][-1] + 1 - length
+            else:  # not leaving block. just shift the timeslots
+                for sess in course:
+                    sess.timeslot += shift
 
         # try to shift in the given direction, otherwise try the opposite
         try:
@@ -323,15 +403,8 @@ def mut_timetable(ind, rooms, faculty):
         for sess in course:
             sess.room = room
 
-    def swap_slot():
-        """Swap a session's timeslot with another's."""
-        # pick a second session
-        course_b = ind[random.randrange(len(ind))]
-        session_b = random.choice(course_b)
-        session.timeslot, session_b.timeslot = session_b.timeslot, session.timeslot
-
     # call a random mutator
-    muts = [shift_slot, change_room, swap_slot]
+    muts = [shift_slot, change_room]
     random.choice(muts)()
 
     return (ind,)
@@ -464,15 +537,6 @@ def main():
         classes.extend(course)
     class_counts = Counter(classes)
 
-    # dummy faculty availability
-    faculty = {}
-    for i in range(math.ceil(len(classes) / 3)):
-        faculty[i] = []
-        for day in range(5):
-            day *= DAY_SLOTS
-            faculty[i].append((day, day+10))
-            faculty[i].append((day+12, day+25))
-
     # generate teachers with availability of 20 timeslots per day split into morning and afternoon
     # TODO: sanity check that no availability crosses a day boundary
     # possibly implemented as a db constraint rather than here
@@ -481,8 +545,8 @@ def main():
         blocks = []
         for day in range(5):
             day *= DAY_SLOTS
-            blocks.append((day, day + 10))
-            blocks.append((day + 12, day + 25))
+            blocks.append(range(day, day + 10))
+            blocks.append(range(day + 12, day + 25))
         faculty.append(Instructor(name=i, avail=blocks))
 
     # dummy course table
@@ -513,7 +577,7 @@ def main():
     for instructor in faculty:
         avail_length = []
         for block in instructor.avail:
-            avail_length.append(block[1] - block[0] + 1)
+            avail_length.append(len(block))
         avail_length.sort()
 
         class_length = []
@@ -551,8 +615,8 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register("select", tools.selTournament, tournsize=2)
 
-    gens = 150  # generations
-    mu = 300  # population size
+    gens = 100  # generations
+    mu = 100  # population size
     lambd = mu  # offspring to create
     cxpb = 0.8  # crossover probability
     mutpb = 0.2  # mutation probability

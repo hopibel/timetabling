@@ -4,7 +4,7 @@ import sys
 import pprint
 
 import random
-from collections import defaultdict, Counter, namedtuple
+from collections import Counter, namedtuple
 import math
 import numpy
 from deap import algorithms, base, creator, tools
@@ -13,6 +13,9 @@ import to_html
 
 DAY_SLOTS = 28
 SLOTS = DAY_SLOTS * 5
+
+
+Room = namedtuple('Room', ['name', 'category'])
 
 
 class Instructor(object):
@@ -63,8 +66,9 @@ class Instructor(object):
 
 class Course(object):
     """Course object for identification purposes in study plans and restrictions."""
-    def __init__(self, name=None):
+    def __init__(self, name=None, room_type=None):
         self.name = name
+        self.room_type = room_type
 
     def matches(self, course):
         """Check whether this course fulfills the given course requirement."""
@@ -114,6 +118,15 @@ class Section(object):
         self.restrictions = restrictions
         self.twice_a_week = twice_a_week
 
+    def is_room_compatible(self, room):
+        """Return whether this course can be held in a given room."""
+        if self.course.room_type is None:
+            return True
+        elif self.course.room_type == room.category:
+            return True
+
+        return False
+
 
 class SessionSchedule(object):
     """Details of a scheduled session for a course."""
@@ -146,7 +159,7 @@ def gen_ind(course_table, rooms, faculty):
     ind = []
     for section in course_table:
         length = section.length
-        room = random.choice(rooms)
+        room = random.choice([room for room in rooms if section.is_room_compatible(room)])
 
         if length % 2 != 0:
             raise ValueError("Splittable class '{}' has odd length".format(section.course['name']))
@@ -461,7 +474,7 @@ def mut_timetable(ind, rooms, faculty):
 
     def change_room():
         """Change a course's room assignment."""
-        room = random.choice(rooms)
+        room = random.choice([room for room in rooms if course[0].section.is_room_compatible(room)])
         for sess in course:
             sess.room = room
 
@@ -479,7 +492,6 @@ def main():
 
     # dummy study plans (only used to generate classes right now)
     programs = ['CS', 'Bio', 'Stat']
-    programs = ['CS', 'Bio']
     plans = plan_gen.generate_study_plans(programs)
 
     program_sizes = {}
@@ -525,7 +537,13 @@ def main():
     # dummy room list
     # if a room can hold 6 classes per day, we need 1 room for every 30 classes
     # i have no idea what the 1.8 is for. probably to account for double-length classes
-    rooms = tuple(range(math.ceil(len(classes) * 1.8 / 30)))
+    # rooms = tuple(range(math.ceil(len(classes) * 1.8 / 30)))
+    rooms = []
+    rooms_needed = math.ceil(len(classes) / 30 / len(programs))
+    room_number = 0
+    for program in programs:
+        for _ in range(rooms_needed):
+            rooms.append(Room(name=room_number, category=program))
 
     # check if faculty have enough contiguous blocks for each class
     for instructor in faculty:
@@ -569,14 +587,14 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register('select', tools.selNSGA2)
 
-    gens = 100  # generations
+    gens = 25  # generations
     mu = 100  # population size
     lambd = mu * 2  # offspring to create
     cxpb = 0.7  # crossover probability
     mutpb = 0.2  # mutation probability
 
     pop = toolbox.population(n=mu)
-    hof = tools.HallOfFame(10)
+    hof = tools.ParetoFront()
     stats = tools.Statistics(key=lambda ind: ind.fitness.values)
     stats.register("avg", numpy.mean, axis=0)
     stats.register("std", numpy.std, axis=0)

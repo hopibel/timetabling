@@ -20,9 +20,10 @@ Room = namedtuple('Room', ['name', 'category'])
 
 class Instructor(object):
     """Details and availability of instructor."""
-    def __init__(self, name, avail):
+    def __init__(self, name, avail, max_consecutive):
         self.name = name
         self.avail = avail
+        self.max_consecutive = max_consecutive
 
         # avail is always sorted and gaps are cached
         self.avail.sort(key=lambda x: x[0])
@@ -320,6 +321,7 @@ def soft_fitness(individual):
 
     Current constraints:
     Minimize unused timeslots between classes per instructor.
+    Minimize runs of consecutive classes that are longer than instructor's preference
     """
     # group sessions by instructor
     instructors = {}
@@ -330,11 +332,14 @@ def soft_fitness(individual):
             instructors[section.section.instructor].append(section)
 
     # count gaps between classes occurring on the same day
+    # count consecutive classes, adding 1 to penalty if it goes above the instructor's preference
     gap_length = 0
+    marathon_penalty = 0
     for instructor, sections in instructors.items():
         # sort by timeslot
         sections.sort(key=lambda x: x.timeslot)
 
+        consecutive = 1
         for i in range(len(sections) - 1):
             a = sections[i]
             b = sections[i + 1]
@@ -348,7 +353,18 @@ def soft_fitness(individual):
                 gap_length += len(gap)
                 gap_length -= len(instructor.gaps[day].intersection(gap))
 
-    return gap_length
+                # count consecutive
+                if a.timeslot + a.length == b.timeslot:
+                    consecutive += 1
+                    if consecutive > instructor.max_consecutive:
+                        marathon_penalty += 1
+                else:
+                    consecutive = 1
+            else:
+                # reset consecutive count between days
+                consecutive = 1
+
+    return gap_length + marathon_penalty
 
 
 def mut_timetable(ind, rooms, faculty):
@@ -492,6 +508,7 @@ def main():
 
     # dummy study plans (only used to generate classes right now)
     programs = ['CS', 'Bio', 'Stat']
+    programs = ['CS', 'Bio']
     plans = plan_gen.generate_study_plans(programs)
 
     program_sizes = {}
@@ -513,7 +530,8 @@ def main():
             day *= DAY_SLOTS
             blocks.append(range(day, day + 10))
             blocks.append(range(day + 12, day + 25))
-        faculty.append(Instructor(name=i, avail=blocks))
+        # randomly choose between 2 or 3 max consecutive sessions
+        faculty.append(Instructor(name=i, avail=blocks, max_consecutive=random.choice((2, 3))))
 
     # dummy course table
     course_table = []
@@ -587,9 +605,9 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register('select', tools.selNSGA2)
 
-    gens = 25  # generations
+    gens = 100  # generations
     mu = 100  # population size
-    lambd = mu * 2  # offspring to create
+    lambd = mu  # offspring to create
     cxpb = 0.7  # crossover probability
     mutpb = 0.2  # mutation probability
 

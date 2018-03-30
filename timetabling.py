@@ -8,7 +8,7 @@ from collections import Counter, namedtuple
 import math
 import numpy
 from deap import algorithms, base, creator, tools
-import plan_gen
+#import plan_gen
 import to_html
 
 DAY_SLOTS = 28
@@ -510,6 +510,8 @@ def main():
     programs = ['CS', 'Bio', 'Stat']
     programs = ['CS', 'Bio']
     plans = plan_gen.generate_study_plans(programs)
+
+    # sqlite progress
 
     program_sizes = {}
     for program_year in plans:

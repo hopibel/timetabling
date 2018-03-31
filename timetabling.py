@@ -511,8 +511,6 @@ def main():
     programs = ['CS', 'Bio']
     plans = plan_gen.generate_study_plans(programs)
 
-    # sqlite progress
-
     program_sizes = {}
     for program_year in plans:
         program_sizes[program_year] = 1
@@ -523,8 +521,6 @@ def main():
     class_counts = Counter(classes)
 
     # generate teachers with availability of 20 timeslots per day split into morning and afternoon
-    # TODO: sanity check that no availability crosses a day boundary
-    # possibly implemented as a db constraint rather than here
     faculty = []
     for i in range(math.ceil(len(classes) / 3)):
         blocks = []

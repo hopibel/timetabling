@@ -8,7 +8,7 @@ from collections import Counter, namedtuple
 import math
 import numpy
 from deap import algorithms, base, creator, tools
-#import plan_gen
+import plan_gen
 import to_html
 
 DAY_SLOTS = 28
@@ -155,6 +155,7 @@ class SessionSchedule(object):
         return self.length + session.length - width
 
 
+# TODO: switch back to integer ID tuples. complex objects in the chromosome cause memory ballooning
 def gen_ind(course_table, rooms, faculty):
     """Generate individual."""
     ind = []
@@ -367,6 +368,7 @@ def soft_fitness(individual):
     return gap_length + marathon_penalty
 
 
+# TODO: think of a better way to mutate. shifting by 1 timeslot seems to cause stagnation
 def mut_timetable(ind, rooms, faculty):
     """Mutate a timetable.
 
@@ -508,7 +510,6 @@ def main():
 
     # dummy study plans (only used to generate classes right now)
     programs = ['CS', 'Bio', 'Stat']
-    programs = ['CS', 'Bio']
     plans = plan_gen.generate_study_plans(programs)
 
     program_sizes = {}
@@ -527,7 +528,7 @@ def main():
         for day in range(5):
             day *= DAY_SLOTS
             blocks.append(range(day, day + 10))
-            blocks.append(range(day + 12, day + 25))
+            blocks.append(range(day + 12, day + 22))
         # randomly choose between 2 or 3 max consecutive sessions
         faculty.append(Instructor(name=i, avail=blocks, max_consecutive=random.choice((2, 3))))
 
@@ -551,15 +552,21 @@ def main():
             faculty_assigned += 1
 
     # dummy room list
-    # if a room can hold 6 classes per day, we need 1 room for every 30 classes
-    # i have no idea what the 1.8 is for. probably to account for double-length classes
-    # rooms = tuple(range(math.ceil(len(classes) * 1.8 / 30)))
     rooms = []
-    rooms_needed = math.ceil(len(classes) / 30 / len(programs))
+    twice = 0
+    once = 0
+    for section in course_table:
+        if section.twice_a_week:
+            twice += 1
+        else:
+            once += 1
+    # i did the math, ok? don't worry about it, it's just dummy data
+    rooms_needed = math.ceil(max(twice / 16, once / 2) / len(programs))
     room_number = 0
     for program in programs:
         for _ in range(rooms_needed):
             rooms.append(Room(name=room_number, category=program))
+            room_number += 1
 
     # check if faculty have enough contiguous blocks for each class
     for instructor in faculty:
@@ -589,7 +596,7 @@ def main():
             else:
                 j += 1
 
-    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0))  # minimize hard and soft constraint violations
+    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0, -1.0))  # minimize hard and soft constraint violations
     creator.create("Individual", list, fitness=creator.Fitness)
 
     toolbox = base.Toolbox()
@@ -603,24 +610,134 @@ def main():
     toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
     toolbox.register('select', tools.selNSGA2)
 
-    gens = 100  # generations
-    mu = 100  # population size
+    ngen = 100  # generations
+    mu = 250  # population size
     lambd = mu  # offspring to create
     cxpb = 0.7  # crossover probability
     mutpb = 0.2  # mutation probability
 
     pop = toolbox.population(n=mu)
-    hof = tools.ParetoFront()
+    # hof = tools.ParetoFront()  # memory ballooning. disable until rewritten to use integer IDs
+    hof = tools.HallOfFame(maxsize=100)
     stats = tools.Statistics(key=lambda ind: ind.fitness.values)
     stats.register("avg", numpy.mean, axis=0)
     stats.register("std", numpy.std, axis=0)
     stats.register("min", numpy.min, axis=0)
     stats.register("max", numpy.max, axis=0)
 
-    algorithms.eaMuPlusLambda(
-        pop, toolbox, mu, lambd, cxpb, mutpb, gens, stats=stats, halloffame=hof, verbose=True)
+    eaMuPlusLambda(
+        pop, toolbox, mu, lambd, cxpb, mutpb, ngen, stats=stats, halloffame=hof, verbose=True)
 
     to_html.to_html(hof[0], SLOTS, DAY_SLOTS)
+
+
+# TODO: clean up
+def eaMuPlusLambda(population, toolbox, mu, lambda_, cxpb, mutpb, ngen,
+                   stats=None, halloffame=None, verbose=__debug__):
+    """This is the :math:`(\mu + \lambda)` evolutionary algorithm.
+    :param population: A list of individuals.
+    :param toolbox: A :class:`~deap.base.Toolbox` that contains the evolution
+                    operators.
+    :param mu: The number of individuals to select for the next generation.
+    :param lambda\_: The number of children to produce at each generation.
+    :param cxpb: The probability that an offspring is produced by crossover.
+    :param mutpb: The probability that an offspring is produced by mutation.
+    :param ngen: The number of generation.
+    :param stats: A :class:`~deap.tools.Statistics` object that is updated
+                  inplace, optional.
+    :param halloffame: A :class:`~deap.tools.HallOfFame` object that will
+                       contain the best individuals, optional.
+    :param verbose: Whether or not to log the statistics.
+    :returns: The final population
+    :returns: A class:`~deap.tools.Logbook` with the statistics of the
+              evolution.
+    The algorithm takes in a population and evolves it in place using the
+    :func:`varOr` function. It returns the optimized population and a
+    :class:`~deap.tools.Logbook` with the statistics of the evolution. The
+    logbook will contain the generation number, the number of evalutions for
+    each generation and the statistics if a :class:`~deap.tools.Statistics` is
+    given as argument. The *cxpb* and *mutpb* arguments are passed to the
+    :func:`varOr` function. The pseudocode goes as follow ::
+        evaluate(population)
+        for g in range(ngen):
+            offspring = varOr(population, toolbox, lambda_, cxpb, mutpb)
+            evaluate(offspring)
+            population = select(population + offspring, mu)
+    First, the individuals having an invalid fitness are evaluated. Second,
+    the evolutionary loop begins by producing *lambda_* offspring from the
+    population, the offspring are generated by the :func:`varOr` function. The
+    offspring are then evaluated and the next generation population is
+    selected from both the offspring **and** the population. Finally, when
+    *ngen* generations are done, the algorithm returns a tuple with the final
+    population and a :class:`~deap.tools.Logbook` of the evolution.
+    This function expects :meth:`toolbox.mate`, :meth:`toolbox.mutate`,
+    :meth:`toolbox.select` and :meth:`toolbox.evaluate` aliases to be
+    registered in the toolbox. This algorithm uses the :func:`varOr`
+    variation.
+    """
+    logbook = tools.Logbook()
+    logbook.header = ['gen', 'nevals'] + (stats.fields if stats else [])
+
+    # Evaluate the individuals with an invalid fitness
+    invalid_ind = [ind for ind in population if not ind.fitness.valid]
+    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+    for ind, fit in zip(invalid_ind, fitnesses):
+        ind.fitness.values = fit
+
+    if halloffame is not None:
+        halloffame.update(population)
+
+    record = stats.compile(population) if stats is not None else {}
+    logbook.record(gen=0, nevals=len(invalid_ind), **record)
+    if verbose:
+        print(logbook.stream)
+
+    # Begin the generational process
+    # Stopping criteria: perfect solution, hard penalty == 0 and best fitness unchanged for > 200 generations
+    best_fitness = invalid_ind[0].fitness.values
+    last_improvement = 0
+    gen = 1
+    while True:
+        # Vary the population
+        offspring = algorithms.varOr(population, toolbox, lambda_, cxpb, mutpb)
+
+        # Evaluate the individuals with an invalid fitness
+        invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+        fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+        old_best = best_fitness
+        for ind, fit in zip(invalid_ind, fitnesses):
+            ind.fitness.values = fit
+
+            # Update best fitness for stopping criteria
+            if fit[0] < best_fitness[0]:
+                best_fitness = fit
+            elif fit[0] == best_fitness[0] and fit[1] < best_fitness[1]:
+                best_fitness = fit
+        if any([new < old for new, old in zip(best_fitness, old_best)]):
+            last_improvement = 0
+        else:
+            last_improvement += 1
+
+        # Update the hall of fame with the generated individuals
+        if halloffame is not None:
+            halloffame.update(offspring)
+
+        # Select the next generation population
+        population[:] = toolbox.select(population + offspring, mu)
+
+        # Update the statistics with the new population
+        record = stats.compile(population) if stats is not None else {}
+        logbook.record(gen=gen, nevals=len(invalid_ind), **record)
+        if verbose:
+            print(logbook.stream)
+
+        # Check for stopping criteria
+        if (best_fitness[0] == 0 and best_fitness[1] == 0) or last_improvement > 200:
+            break
+
+        gen += 1
+
+    return population, logbook
 
 
 if __name__ == '__main__':

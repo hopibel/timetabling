@@ -16,6 +16,20 @@ SLOTS = DAY_SLOTS * 5
 
 
 Room = namedtuple('Room', ['name', 'category'])
+Restriction = namedtuple('Restriction', ['program', 'year'])
+
+
+class SectionGene(object):
+    __slots__ = ('section_id', 'slot', 'room', 'is_twice_weekly')
+
+    def __init__(self, section_id, slot, room, is_twice_weekly):
+        self.section_id = section_id
+        self.slot = slot
+        self.room = room
+        self.is_twice_weekly = is_twice_weekly
+
+    def copy(self):
+        return SectionGene(self.section_id, self.slot, self.room, self.is_twice_weekly)
 
 
 class Instructor(object):
@@ -24,22 +38,16 @@ class Instructor(object):
         self.name = name
         self.avail = avail
         self.max_consecutive = max_consecutive
+        self.gaps = set()
 
-        # avail is always sorted and gaps are cached
-        self.avail.sort(key=lambda x: x[0])
-
-        self.gaps = {}
-        for i in range(5):
-            self.gaps[i] = set()
-
-        for i in range(len(self.avail) - 1):
-            a = self.avail[i]
-            b = self.avail[i + 1]
-
-            # check if same day
-            if a[0] // DAY_SLOTS == b[0] // DAY_SLOTS:
-                day = a[0] // DAY_SLOTS
-                self.gaps[day].update(range(a[-1] + 1, b[0]))
+        # cache gaps
+        lavail = list(avail)
+        lavail.sort()
+        for i in range(len(lavail) - 1):
+            same_day = lavail[i] // DAY_SLOTS == lavail[i+1] // DAY_SLOTS
+            consecutive = lavail[i] + 1 == lavail[i + 1]
+            if same_day and not consecutive:
+                self.gaps.update(range(lavail[i]+1, lavail[i+1]))
 
     def valid_blocks(self, length):
         """Return indexes of availability blocks of a minimum length."""
@@ -105,19 +113,19 @@ class WildcardCourse(Course):
 
 class Section(object):
     """Specific section from a Course used to build course table and schedule."""
-    def __init__(self, course, id_, instructor, length, restrictions, twice_a_week):
+    def __init__(self, course, id_, instructor, length, restrictions, is_twice_weekly):
         """
         course (Course): Course that this Section belongs to
         id_ (hashable): section ID
         instructor (Instructor): Instructor details
-        twice_a_week (bool): whether the section is split into two weekly sessions
+        is_twice_weekly (bool): whether the section is split into two weekly sessions
         """
         self.course = course
         self.id_ = id_
         self.instructor = instructor
         self.length = length
         self.restrictions = restrictions
-        self.twice_a_week = twice_a_week
+        self.is_twice_weekly = is_twice_weekly
 
     def is_room_compatible(self, room):
         """Return whether this course can be held in a given room."""
@@ -156,63 +164,51 @@ class SessionSchedule(object):
 
 
 # TODO: switch back to integer ID tuples. complex objects in the chromosome cause memory ballooning
-def gen_ind(course_table, rooms, faculty):
-    """Generate individual."""
+# individual generation
+# rewrite evaluation to use new chromosome
+# TODO: rewrite mutation to use new chromosome
+def gen_ind(sections, rooms):
+    """
+    Generate individual.
+
+    Chromosome is a list of tuples with 4 values:
+    [(C, S, R, T), ...]
+
+    C = section id
+    S = timeslot (half hour offsets from beginning of the day)
+    R = room id
+    T = twice a week flag
+    """
     ind = []
-    for section in course_table:
-        length = section.length
-        room = random.choice([room for room in rooms if section.is_room_compatible(room)])
+    for section_id, section in enumerate(sections):
+        room_id = random.choice([room_id for room_id, room in enumerate(rooms) if section.is_room_compatible(room)])
 
-        if length % 2 != 0:
-            raise ValueError("Splittable class '{}' has odd length".format(section.course['name']))
+        # valid timeslots where this section can be scheduled
+        available = section.instructor.avail
+        valid_slots = []
+        for slot in available:
+            # ensure we don't cross day boundaries
+            same_day = slot // DAY_SLOTS == (slot + section.length - 1) // DAY_SLOTS
+            slot_is_valid = set(range(slot, slot + section.length)).issubset(available) and same_day
 
-        # TODO: sync meetings
-        sessions = []
-        if section.twice_a_week:
-            length //= 2
-            # indexes of availability blocks large enough to hold this class
-            blocks = section.instructor.valid_blocks(length)
-            first_blocks = [b for b in blocks if section.instructor.avail[b][0] < DAY_SLOTS * 2]
+            if section.is_twice_weekly:
+                meeting2 = slot + DAY_SLOTS * 3
+                same_day = meeting2 // DAY_SLOTS == (meeting2 + section.length - 1) // DAY_SLOTS
+                meeting2_is_valid = set(range(meeting2, meeting2 + section.length)).issubset(available) and same_day
+            else:
+                meeting2_is_valid = True
 
-            # choose second blocks three days after a first block and overlap >= length
-            # filter out first blocks with no corresponding second
-            block_pairs = []
-            for first in first_blocks:
-                f = section.instructor.avail[first]
-                shifted = range(f[0] + DAY_SLOTS * 3, f[-1] + 1 + DAY_SLOTS * 3)
-                for b in blocks:
-                    if len(set(shifted).intersection(section.instructor.avail[b])) >= length:
-                        block_pairs.append((first, b))
-                        break
+            if slot_is_valid and meeting2_is_valid:
+                valid_slots.append(slot)
 
-            pair = random.choice(block_pairs)
-            first = section.instructor.avail[pair[0]]
-            second = section.instructor.avail[pair[1]]
-
-            # pick a random block and schedule the second session at the same time 3 days later
-            start = max(first[0], second[0] - DAY_SLOTS * 3)
-            end = min(first[-1], second[-1] - DAY_SLOTS * 3)
-            slot = random.randrange(start, end + 1 - length)
-            sessions.append(SessionSchedule(section, slot, length, room, pair[0]))
-            sessions.append(SessionSchedule(section, slot + DAY_SLOTS * 3, length, room, pair[1]))
-        else:
-            # single session scheduling. no sync needed
-            blocks = section.instructor.valid_blocks(length)
-
-            i = random.choice(blocks)
-            start = section.instructor.avail[i][0]
-            end = section.instructor.avail[i][-1]
-            slot = random.randrange(start, end+1 - length)
-            sessions.append(SessionSchedule(section, slot, length, room, i))
-
-        ind.append(sessions)
-
+        slot = random.choice(valid_slots)
+        ind.append(SectionGene(section_id, slot, room_id, section.is_twice_weekly))
     return ind
 
 
 # treat all GEs and electives as one category. GEs are numerous enough that there will usually be an available class.
 # electives are often course specific so they're covered by restrictions already
-def eval_timetable(individual, course_table, program_sizes, study_plans):
+def eval_timetable(individual, sections, program_sizes, study_plans):
     """Calculate timetable cost.
 
     Currently calculates:
@@ -221,101 +217,124 @@ def eval_timetable(individual, course_table, program_sizes, study_plans):
     """
     overlap = 0
 
-    times = []
-    for course in individual:
-        for session in course:
-            times.append(session)
-    times.sort(key=lambda x: x.timeslot)
+    times = []  # list of (section_id, timeslot, room_id)
+    for section in individual:
+        times.append(section)
+        if section.is_twice_weekly:
+            # append second meeting
+            second_meeting = section.copy()
+            second_meeting.slot += DAY_SLOTS * 3
+            times.append(second_meeting)
+    times.sort(key=lambda x: x.slot)
 
-    # the time covered by two classes must be at least equal to their combined duration to avoid overlaps
-    for i, _ in enumerate(times):
+    # total slots covered by two classes must be >= total length of both classes to avoid overlap
+    for i in range(len(times) - 1):
         a = times[i]
+        a_section = sections[a.section_id]
         for j in range(i + 1, len(times)):
             b = times[j]
-            if a.can_overlap(b):
-                ab_overlap = a.calculate_overlap(b)
-                if ab_overlap == 0:  # b and everything afterwards don't overlap with a. break early
-                    break
-                else:
-                    overlap += ab_overlap
+            b_section = sections[b.section_id]
 
-    overallocation = 0
+            # check for overlap if a and b share a room or instructor
+            if a.room == b.room or a_section.instructor == b_section.instructor:
+                if b.slot >= a.slot + a_section.length:
+                    break  # no overlap from here onward since times are sorted
+
+                # overlap = min required width - actual width
+                width = (max(a.slot + a_section.length,
+                            b.slot + b_section.length)
+                         - min(a.slot, b.slot))
+                overlap += a_section.length + b_section.length - width
+
+    overallocated = 0
     for slot in range(SLOTS):
-        # find classes sharing this timeslot
+        # find classes sharing this timeslot, cover both meetings
         classes = []
-        for course in individual:
-            for session in course:
-                if slot >= session.timeslot and slot < session.timeslot + session.length:
-                    classes.append(session)
+        for section in individual:
+            section_data = sections[section.section_id]
+            start = section.slot
+            end = start + section_data.length
 
-        # sort by restrictions to ensure most restricted are allocated first
-        def count_allowed(course_name, course_table):
+            if slot in range(start, end):
+                classes.append(section)
+            if section.is_twice_weekly:
+                start += DAY_SLOTS * 3
+                end += DAY_SLOTS * 3
+                if slot in range(start, end):
+                    classes.append(section)
+
+        # sort by most restricted
+        # TODO: sort by section size then restrictions
+        def count_allowed(section):
             """
             Count the number of groups allowed to take a course.
             Returns infinity for no restrictions
             """
-            course = next(course for course in course_table if course.course.name == course_name)
-
-            # we want classes with no restrictions to be last in the list
-            if not course.restrictions:
+            # unrestricted should be allocated last
+            if not section.restrictions:
                 return float('inf')
 
             allowed = 0
-            for restriction in course.restrictions:
-                if restriction.year is not None:
+            for restriction in section.restrictions:
+                # no year restriction means all years of a course can take
+                if restriction.year is None:
                     allowed += 4
                 else:
                     allowed += 1
-
             return allowed
-        classes.sort(key=lambda x: count_allowed(x.section.course.name, course_table))
+        classes.sort(key=lambda x: count_allowed(sections[x.section_id]))
 
-        # TODO: take class size/capacity into account
-        program_capacities = {}
-        for schedule in classes:
-            # assume all are overallocated and subtract later
-            overallocation += 1
+        # TODO: take program-year size and section capacity into account
+        program_alloc = {}
+        for section in classes:
+            # sum section capacities and subtract allocation later. anything left is overallocation
+            overallocated += 1  # TODO: replace 1 with section size, i think
 
-            # add programs/years that this course is restricted to
-            for restriction in schedule.section.restrictions:
-                if restriction.year is not None:
-                    program_year = (restriction.program, restriction.year)
-                    program_capacities[program_year] = program_sizes[program_year]
-                else:
+            # only consider programs/years that this section is restricted to
+            section_data = sections[section.section_id]
+            for restriction in section_data.restrictions:
+                if restriction.year is None:
                     for program_year, count in program_sizes.items():
                         if program_year[0] == restriction.program:
-                            program_capacities[program_year] = count
+                            program_alloc[program_year] = count
+                else:
+                    program_alloc[tuple(restriction)] = program_sizes[tuple(restriction)]
 
-            # no restrictions. add all programs/years with this course in their study plan
-            if not schedule.section.restrictions:
+            # if unrestricted, add all programs/years whose study plan contains the course
+            if not section_data.restrictions:
                 for program_year, plan in study_plans.items():
-                    for course in plan:
-                        if schedule.section.course.matches(course):
-                            program_capacities[program_year] = program_sizes[program_year]
+                    for requirement in plan:
+                        if section_data.course.matches(requirement):
+                            program_alloc[program_year] = program_sizes[program_year]
                             break
 
-        for schedule in classes:
-            # allocate program size to classes from most to least restricted. unused class capacity gets penalized
-            for restriction in schedule.section.restrictions:
-                if program_capacities[restriction] > 0:
-                    program_capacities[restriction] -= 1
-                    overallocation -= 1
+        # allocate program size to classes from most to least restricted
+        # unused class capacity is overallocation
+        for section in classes:
+            section_data = sections[section.section_id]
+
+            for restriction in section_data.restrictions:
+                if program_alloc[restriction] > 0:
+                    # TODO: subtract section size instead of 1
+                    program_alloc[restriction] -= 1
+                    overallocated -= 1
                     break
 
-            if not schedule.section.restrictions:
-                for program_year, size in program_capacities.items():
+            if not section_data.restrictions:
+                for program_year, size in program_alloc.items():
                     if size > 0:
-                        program_capacities[program_year] -= 1
-                        overallocation -= 1
+                        # TODO: subtract section size
+                        program_alloc[program_year] -= 1
+                        overallocated -= 1
                         break
 
-    # soft constraint fitness
-    soft_score = soft_fitness(individual)
+    # soft constraint fitness (penalty. minimize)
+    soft_penalty = soft_fitness(individual, sections)
 
-    return (overlap + overallocation, soft_score)
+    return (overlap, overallocated, soft_penalty)
 
 
-def soft_fitness(individual):
+def soft_fitness(individual, sections):
     """
     Calculate soft constraint fitness penalties.
     Value is a single sum for simplicity.
@@ -324,264 +343,154 @@ def soft_fitness(individual):
     Minimize unused timeslots between classes per instructor.
     Minimize runs of consecutive classes that are longer than instructor's preference
     """
-    # group sessions by instructor
+    # group sections by instructor
     instructors = {}
-    for course in individual:
-        if course[0].section.instructor not in instructors:
-            instructors[course[0].section.instructor] = []
-        for section in course:
-            instructors[section.section.instructor].append(section)
+    for section in individual:
+        section_data = sections[section.section_id]
 
-    # count gaps between classes occurring on the same day
-    # count consecutive classes, adding 1 to penalty if it goes above the instructor's preference
+        if section_data.instructor not in instructors:
+            instructors[section_data.instructor] = []
+            instructors[section_data.instructor].append(section)
+        if section.is_twice_weekly:
+            second_meeting = section.copy()
+            second_meeting.slot += DAY_SLOTS * 3
+            instructors[section_data.instructor].append(second_meeting)
+
+    # count gaps between classes held on the same day
+    # count consecutive classes, penalize if above instructor's preference
     gap_length = 0
-    marathon_penalty = 0
-    for instructor, sections in instructors.items():
+    consecutive_penalty = 0
+    for instructor, meetings in instructors.items():
         # sort by timeslot
-        sections.sort(key=lambda x: x.timeslot)
+        meetings.sort(key=lambda x: x.slot)
 
         consecutive = 1
-        for i in range(len(sections) - 1):
-            a = sections[i]
-            b = sections[i + 1]
+        for i in range(len(meetings) - 1):
+            a = meetings[i]
+            b = meetings[i + 1]
+
+            a_data = sections[a.section_id]
 
             # check if same day
-            # ignore gap if it is present in availability schedule already
-            if a.timeslot // DAY_SLOTS == b.timeslot // DAY_SLOTS:
-                gap = range(a.timeslot + a.length, b.timeslot)
-                day = a.timeslot // DAY_SLOTS
+            # ignore gap if it is from the instructor's availability schedule
+            if a.slot // DAY_SLOTS == b.slot // DAY_SLOTS:
+                gap = range(a.slot + a_data.length, b.slot)
 
                 gap_length += len(gap)
-                gap_length -= len(instructor.gaps[day].intersection(gap))
+                gap_length -= len(instructor.gaps.intersection(gap))
 
-                # count consecutive
-                if a.timeslot + a.length == b.timeslot:
+                # count_consecutive
+                if a.slot + a_data.length == b.slot:
                     consecutive += 1
                     if consecutive > instructor.max_consecutive:
-                        marathon_penalty += 1
+                        consecutive_penalty += 1
                 else:
                     consecutive = 1
             else:
                 # reset consecutive count between days
                 consecutive = 1
 
-    return gap_length + marathon_penalty
+    return gap_length + consecutive_penalty
 
 
 # TODO: think of a better way to mutate. shifting by 1 timeslot seems to cause stagnation
-def mut_timetable(ind, rooms, faculty):
+def mut_timetable(ind, sections, rooms, faculty):
     """Mutate a timetable.
 
-    Shift a class timeslot by 1
+    Shift a class timeslot by 1, small chance of completely random slot.
     Change classrooms
-    Swap two timeslots
     """
-    i = random.randrange(len(ind))
-    course = ind[i]
+    section = random.choice(ind)
+    section_data = sections[section.section_id]
+
+    def get_valid_slots():
+        """
+        Get valid timeslots for mutation.
+        """
+        # assume we already confirmed that availability >= load
+
+        # valid timeslots where this section can be scheduled
+        available = section_data.instructor.avail
+        valid_slots = []
+        for slot in available:
+            # ensure we don't cross day boundaries
+            same_day = slot // DAY_SLOTS == (slot + section_data.length - 1) // DAY_SLOTS
+            slot_is_valid = set(range(slot, slot + section_data.length)).issubset(available) and same_day
+
+            if section.is_twice_weekly:
+                meeting2 = slot + DAY_SLOTS * 3
+                same_day = meeting2 // DAY_SLOTS == (meeting2 + section_data.length - 1) // DAY_SLOTS
+                meeting2_is_valid = set(range(meeting2, meeting2 + section_data.length)).issubset(available) and same_day
+            else:
+                meeting2_is_valid = True
+
+            if slot_is_valid and meeting2_is_valid:
+                valid_slots.append(slot)
+        return valid_slots
 
     def shift_slot():
-        """Shift class forward or back by one time slot."""
-        # TODO: keep classes within availability blocks
-        # assume we already confirmed that availability >= load
-        shift = random.choice((1, -1))
+        """
+        Shift class forward or back by one time slot.
+        """
+        valid_slots = get_valid_slots()
 
-        blocks = course[0].section.instructor.avail
+        slot_index = valid_slots.index(section.slot)
+        if slot_index == 0:
+            slot = valid_slots[1]
+        elif slot_index == len(valid_slots) - 1:
+            slot = valid_slots[-2]
+        else:
+            slot = valid_slots[random.choice((slot_index + 1, slot_index - 1))]
 
-        # bounds checking
-        # if moving one way goes out of bounds, move the other way
-        before_first = False
-        after_last = False
-        for sess in course:
-            before_first = before_first or sess.timeslot + shift < 0
-            after_last = after_last or sess.timeslot + sess.length + shift > SLOTS
+        section.slot = slot
 
-        if before_first or after_last:
-            shift = -shift
-
-        def move_session(shift):
-            """
-            Move a class session in the shift direction.
-            Throws ValueError when session cannot be shifted.
-            """
-            before_block = False
-            after_block = False
-            for sess in course:
-                before_block = before_block or sess.timeslot + shift < blocks[sess.block][0]
-                after_block = after_block or sess.timeslot + sess.length - 1 + shift > blocks[sess.block][-1]
-
-            instructor = course[0].section.instructor
-            length = course[0].section.length
-            assert len(course) == 1 or instructor == course[1].section.instructor
-            assert len(course) == 1 or length == course[1].section.length
-            if before_block or after_block:
-                # leaving block. is there a suitable adjacent one?
-                reverse = shift < 0
-
-                if len(course) > 1:  # 2 sessions
-                    block_a = instructor.next_valid_block(course[0].block, length, reverse)
-                    block_b = instructor.next_valid_block(course[1].block, length, reverse)
-
-                    first_block = blocks[block_a]
-                    second_block = blocks[block_b]
-
-                    # advance blocks until a valid pair is found for MTh or TF
-                    while True:
-                        shifted = range(second_block[0] - DAY_SLOTS * 3, second_block[-1] + 1 - DAY_SLOTS * 3)
-                        if len(set(shifted).intersection(first_block)) < length:
-                            if not reverse:
-                                shift_first = first_block[0] < shifted[0]
-                            else:
-                                shift_first = first_block[-1] >= shifted[-1]
-
-                            if shift_first:
-                                block_a = instructor.next_valid_block(block_a, length, reverse)
-                                first_block = blocks[block_a]
-                            else:
-                                block_b = instructor.next_valid_block(block_b, length, reverse)
-                                second_block = blocks[block_b]
-                        else:
-                            break
-
-                    # assign new blocks and timeslots
-                    course[0].block = block_a
-                    course[1].block = block_b
-
-                    # get correct slot for direction
-                    if not reverse:
-                        slot = max(blocks[block_a][0], blocks[block_b][0] - DAY_SLOTS * 3)
-                    else:
-                        slot = min(blocks[block_a][-1], blocks[block_b][-1] - DAY_SLOTS * 3)
-                        slot = slot + 1 - length
-
-                    course[0].timeslot = slot
-                    course[1].timeslot = slot + DAY_SLOTS * 3
-                else:  # 1 session
-                    sess = course[0]
-                    sess.block = instructor.next_valid_block(sess.block, length, reverse)
-
-                    if not reverse:  # forward
-                        sess.timeslot = blocks[sess.block][0]
-                    else:  # backward
-                        sess.timeslot = blocks[sess.block][-1] + 1 - length
-            else:  # not leaving block. just shift the timeslots
-                for sess in course:
-                    sess.timeslot += shift
-
-        # try to shift in the given direction, otherwise try the opposite
-        try:
-            move_session(shift)
-        except ValueError:
-            try:
-                move_session(-shift)
-            except ValueError:
-                pass
-
-        # day boundary checking
-        # fully move across boundary
-        # TODO: ensure faculty blocks don't cross boundaries
-#        start = session['slot']
-#        end = start + session['len'] - 1
-#        if start // DAY_SLOTS != end // DAY_SLOTS:
-#            if shift == 1:
-#                session['slot'] = end // DAY_SLOTS * DAY_SLOTS
-#            else:
-#                session['slot'] = end // DAY_SLOTS * DAY_SLOTS - session['len']
-#
-#            if session['slot'] < 0:
-#                print("{} {} {} {}".format(session, start, end, shift))
+    def random_slot():
+        """
+        Move a class to a completely random timeslot.
+        Used to avoid stagnation towards the end of a run.
+        """
+        valid_slots = get_valid_slots()
+        section.slot = random.choice(valid_slots)
 
     def change_room():
         """Change a course's room assignment."""
-        room = random.choice([room for room in rooms if course[0].section.is_room_compatible(room)])
-        for sess in course:
-            sess.room = room
+        section.room = random.choice([room_id for room_id, room in enumerate(rooms)
+                                      if section_data.is_room_compatible(room)])
 
-    # call a random mutator
-    muts = [shift_slot, change_room]
-    random.choice(muts)()
+    # call a random mutator with the given weights
+    mutators = [shift_slot, random_slot, change_room]
+    weights = [0.45, 0.1, 0.45]
+    numpy.random.choice(mutators, p=weights)()
 
     return (ind,)
 
 
-def main():
-    """Entry point if called as executable."""
-
-    random.seed('feffy')
-
-    # dummy study plans (only used to generate classes right now)
-    programs = ['CS', 'Bio', 'Stat']
-    plans = plan_gen.generate_study_plans(programs)
-
-    program_sizes = {}
-    for program_year in plans:
-        program_sizes[program_year] = 1
-
-    classes = []
-    for course in plans.values():
-        classes.extend(course)
-    class_counts = Counter(classes)
-
-    # generate teachers with availability of 20 timeslots per day split into morning and afternoon
-    faculty = []
-    for i in range(math.ceil(len(classes) / 3)):
-        blocks = []
-        for day in range(5):
-            day *= DAY_SLOTS
-            blocks.append(range(day, day + 10))
-            blocks.append(range(day + 12, day + 22))
-        # randomly choose between 2 or 3 max consecutive sessions
-        faculty.append(Instructor(name=i, avail=blocks, max_consecutive=random.choice((2, 3))))
-
-    # dummy course table
-    course_table = []
-    restriction = namedtuple('restriction', ['program', 'year'])
-    faculty_assigned = 0
-    for course in class_counts.keys():
-        for section_number in range(1, class_counts[course]+1):
-            # store restrictions as list of namedtuples with program and year
-            # setting program or year to None acts as wildcard
-            restrictions = []
-            year = int(course.name[course.name.index('-')+1])
-            for p in programs:
-                if course.name.startswith(p):
-                    restrictions.append(restriction(program=p, year=year))
-
-            twice_a_week = random.random() > 0.2
-            section = Section(course, section_number, faculty[faculty_assigned // 3], 6, restrictions, twice_a_week)
-            course_table.append(section)
-            faculty_assigned += 1
-
-    # dummy room list
-    rooms = []
-    twice = 0
-    once = 0
-    for section in course_table:
-        if section.twice_a_week:
-            twice += 1
-        else:
-            once += 1
-    # i did the math, ok? don't worry about it, it's just dummy data
-    rooms_needed = math.ceil(max(twice / 16, once / 2) / len(programs))
-    room_number = 0
-    for program in programs:
-        for _ in range(rooms_needed):
-            rooms.append(Room(name=room_number, category=program))
-            room_number += 1
-
+def validate_faculty_load(faculty, sections):
     # check if faculty have enough contiguous blocks for each class
     for instructor in faculty:
         avail_length = []
-        for block in instructor.avail:
-            avail_length.append(len(block))
+        block_list = list(instructor.avail)
+        block_list.sort()
+
+        # get lengths of contiguous availability slots
+        length = 1
+        for i in range(1, len(block_list)):
+            if block_list[i] > block_list[i - 1] + 1:
+                avail_length.append(length)
+                length = 1
+            else:
+                length += 1
+        if length > 1:
+            avail_length.append(length)
+
         avail_length.sort()
 
         class_length = []
-        for course in [x for x in course_table if x.instructor.name == instructor.name]:
-            if course.twice_a_week:
-                class_length.append(course.length // 2)
-                class_length.append(course.length // 2)
+        for section in [s for s in sections if s.instructor == instructor]:
+            if section.is_twice_weekly:
+                class_length.extend([section.length] * 2)
             else:
-                class_length.append(course.length)
+                class_length.append(section.length)
         class_length.sort()
 
         i = 0
@@ -596,39 +505,124 @@ def main():
             else:
                 j += 1
 
-    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0, -1.0))  # minimize hard and soft constraint violations
+
+def main():
+    """Entry point if called as executable."""
+
+    random.seed('feffy')
+
+    # dummy study plans (only used to generate classes right now)
+    programs = ['CS', 'Bio', 'Stat']
+#    programs = ['CS']
+    plans = plan_gen.generate_study_plans(programs)
+
+    program_sizes = {}
+    for program_year in plans:
+        program_sizes[program_year] = 1
+
+    classes = []
+    for course in plans.values():
+        classes.extend(course)
+    class_counts = Counter(classes)
+
+    # generate teachers with availability of 20 timeslots per day split into morning and afternoon
+    faculty = []
+    for i in range(math.ceil(len(classes) / 3)):
+        blocks = set()
+        for day in range(5):
+            day *= DAY_SLOTS
+            blocks.update(range(day, day + 10))
+            blocks.update(range(day + 12, day + 22))
+        # randomly choose between 2 or 3 max consecutive sessions
+        faculty.append(Instructor(name=i, avail=blocks, max_consecutive=random.choice((2, 3))))
+
+    # dummy section table. a section is an instance of a course
+    sections = []
+    faculty_assigned = 0
+    for course in class_counts.keys():
+        for section_number in range(1, class_counts[course]+1):
+            # store restrictions as list of namedtuples with program and year
+            # setting program or year to None acts as wildcard
+            restrictions = []
+            year = int(course.name[course.name.index('-')+1])
+            for p in programs:
+                if course.name.startswith(p):
+                    restrictions.append(Restriction(program=p, year=year))
+
+            is_twice_weekly = random.random() > 0.2
+            section = Section(
+                course,
+                section_number,
+                faculty[faculty_assigned // 3],
+                3 if is_twice_weekly else 6,
+                restrictions,
+                is_twice_weekly)
+            sections.append(section)
+            faculty_assigned += 1
+
+    # dummy room list
+    rooms = []
+    twice = 0
+    once = 0
+    for section in sections:
+        if section.is_twice_weekly:
+            twice += 1
+        else:
+            once += 1
+    # i did the math, ok? don't worry about it, it's just dummy data
+    rooms_needed = math.ceil(max(twice / 16, once / 2) / len(programs))
+    room_number = 0
+    for program in programs:
+        for _ in range(rooms_needed):
+            rooms.append(Room(name=room_number, category=program))
+            room_number += 1
+
+    validate_faculty_load(faculty, sections)
+
+    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0, -1.0))
     creator.create("Individual", list, fitness=creator.Fitness)
 
     toolbox = base.Toolbox()
-    toolbox.register("ind", gen_ind, course_table=course_table, rooms=rooms, faculty=faculty)
+    toolbox.register("ind", gen_ind, sections=sections, rooms=rooms)
     toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.ind)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
     toolbox.register("evaluate", eval_timetable,
-                     course_table=course_table, program_sizes=program_sizes, study_plans=plans)
+                     sections=sections,
+                     program_sizes=program_sizes,
+                     study_plans=plans)
     toolbox.register("mate", tools.cxOnePoint)
-    toolbox.register("mutate", mut_timetable, rooms=rooms, faculty=faculty)
-    toolbox.register('select', tools.selNSGA2)
+    toolbox.register("mutate", mut_timetable,
+                     sections=sections,
+                     rooms=rooms,
+                     faculty=faculty)
+    toolbox.register('select', tools.selNSGA2, nd='log')
 
     ngen = 100  # generations
-    mu = 250  # population size
+    mu = 100  # population size
     lambd = mu  # offspring to create
     cxpb = 0.7  # crossover probability
     mutpb = 0.2  # mutation probability
 
     pop = toolbox.population(n=mu)
-    # hof = tools.ParetoFront()  # memory ballooning. disable until rewritten to use integer IDs
-    hof = tools.HallOfFame(maxsize=100)
+    hof = tools.ParetoFront()
     stats = tools.Statistics(key=lambda ind: ind.fitness.values)
     stats.register("avg", numpy.mean, axis=0)
     stats.register("std", numpy.std, axis=0)
     stats.register("min", numpy.min, axis=0)
     stats.register("max", numpy.max, axis=0)
 
-    eaMuPlusLambda(
-        pop, toolbox, mu, lambd, cxpb, mutpb, ngen, stats=stats, halloffame=hof, verbose=True)
+    try:
+        eaMuPlusLambda(
+            pop, toolbox, mu, lambd, cxpb, mutpb, ngen, stats=stats, halloffame=hof, verbose=True)
+    except KeyboardInterrupt:
+        pass
 
-    to_html.to_html(hof[0], SLOTS, DAY_SLOTS)
+    print(eval_timetable(hof[0], sections, program_sizes, plans))
+    # final set of solutions
+    # final_front = tools.sortLogNondominated(pop, 1, first_front_only=True)
+
+    to_html.to_html(hof[0], sections, SLOTS, DAY_SLOTS)
 
 
 # TODO: clean up
@@ -709,11 +703,15 @@ def eaMuPlusLambda(population, toolbox, mu, lambda_, cxpb, mutpb, ngen,
             ind.fitness.values = fit
 
             # Update best fitness for stopping criteria
-            if fit[0] < best_fitness[0]:
+            # Assumes minimization fitness functions
+            as_good = all([new <= old for new, old in zip(fit, best_fitness)])
+            strictly_better = any([new < old for new, old in zip(fit, best_fitness)])
+            if as_good and strictly_better:
                 best_fitness = fit
-            elif fit[0] == best_fitness[0] and fit[1] < best_fitness[1]:
-                best_fitness = fit
-        if any([new < old for new, old in zip(best_fitness, old_best)]):
+
+        as_good = all([new <= old for new, old in zip(best_fitness, old_best)])
+        better = any([new < old for new, old in zip(best_fitness, old_best)])
+        if as_good and better:
             last_improvement = 0
         else:
             last_improvement += 1
@@ -732,8 +730,9 @@ def eaMuPlusLambda(population, toolbox, mu, lambda_, cxpb, mutpb, ngen,
             print(logbook.stream)
 
         # Check for stopping criteria
-        if (best_fitness[0] == 0 and best_fitness[1] == 0) or last_improvement > 200:
+        if sum(best_fitness) == 0 or last_improvement > 200:
             break
+        # TODO: remove logbook and print best fitness
 
         gen += 1
 

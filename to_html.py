@@ -3,16 +3,25 @@
 from collections import defaultdict
 
 
-def to_html(ind, slots, day_slots):
+def to_html(ind, sections, slots, day_slots):
     """Convert timetable to html table."""
     rooms = defaultdict(list)
-    for course in ind:
-        for session in course:
-            rooms[session.room].append({
-                'name': "{}-{}".format(session.section.course.name, session.section.id_),
-                'start': session.timeslot,
-                'end': session.timeslot + session.length - 1,
-            })
+    for section in ind:
+        section_data = sections[section.section_id]
+        meeting = {
+            'name': "{}-{}<br>{}".format(section_data.course.name,
+                                      section_data.id_,
+                                      section_data.instructor.name),
+            'start': section.slot,
+            'end': section.slot + section_data.length - 1,
+        }
+        rooms[section.room].append(meeting)
+
+        if section.is_twice_weekly:
+            meeting2 = meeting.copy()
+            meeting2['start'] += day_slots * 3
+            meeting2['end'] += day_slots * 3
+            rooms[section.room].append(meeting2)
 
     tables = {}
     for key, room in rooms.items():

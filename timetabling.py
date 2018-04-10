@@ -15,7 +15,7 @@ DAY_SLOTS = 28
 SLOTS = DAY_SLOTS * 5
 
 
-Room = namedtuple('Room', ['name', 'category'])
+Room = namedtuple('Room', ['name', 'capacity', 'category'])
 Restriction = namedtuple('Restriction', ['program', 'year'])
 
 
@@ -113,7 +113,7 @@ class WildcardCourse(Course):
 
 class Section(object):
     """Specific section from a Course used to build course table and schedule."""
-    def __init__(self, course, id_, instructor, length, restrictions, is_twice_weekly):
+    def __init__(self, course, id_, instructor, length, size, restrictions, is_twice_weekly):
         """
         course (Course): Course that this Section belongs to
         id_ (hashable): section ID
@@ -124,49 +124,19 @@ class Section(object):
         self.id_ = id_
         self.instructor = instructor
         self.length = length
+        self.size = size
         self.restrictions = restrictions
         self.is_twice_weekly = is_twice_weekly
 
     def is_room_compatible(self, room):
         """Return whether this course can be held in a given room."""
-        if self.course.room_type is None:
-            return True
-        elif self.course.room_type == room.category:
-            return True
+        large_enough = room.capacity >= self.size
+        right_type = (self.course.room_type is None
+                      or self.course.room_type == room.category)
 
-        return False
-
-
-class SessionSchedule(object):
-    """Details of a scheduled session for a course."""
-
-    def __init__(self, section, timeslot, length, room, block):  # TODO: calculate block internally
-        self.section = section
-        self.timeslot = timeslot
-        self.length = length
-        self.room = room
-        self.block = block
-
-    def can_overlap(self, session):
-        """Check whether session has the same room or instructor."""
-        return self.room == session.room or self.section.instructor == session.section.instructor
-
-    def calculate_overlap(self, session):
-        """Calculate extent of overlap with another session."""
-        if not self.can_overlap(session):
-            return 0
-        if session.timeslot >= self.timeslot + self.length:  # no time overlap
-            return 0
-
-        # overlap = minimum width required - actual width
-        width = max(self.timeslot+self.length, session.timeslot+session.length) - min(self.timeslot, session.timeslot)
-        return self.length + session.length - width
+        return large_enough and right_type
 
 
-# TODO: switch back to integer ID tuples. complex objects in the chromosome cause memory ballooning
-# individual generation
-# rewrite evaluation to use new chromosome
-# TODO: rewrite mutation to use new chromosome
 def gen_ind(sections, rooms):
     """
     Generate individual.
@@ -181,7 +151,10 @@ def gen_ind(sections, rooms):
     """
     ind = []
     for section_id, section in enumerate(sections):
-        room_id = random.choice([room_id for room_id, room in enumerate(rooms) if section.is_room_compatible(room)])
+        room_id = random.choice([
+            room_id
+            for room_id, room
+            in enumerate(rooms) if section.is_room_compatible(room)])
 
         # valid timeslots where this section can be scheduled
         available = section.instructor.avail
@@ -263,8 +236,7 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
                 if slot in range(start, end):
                     classes.append(section)
 
-        # sort by most restricted
-        # TODO: sort by section size then restrictions
+        # sort by section size then by most restricted
         def count_allowed(section):
             """
             Count the number of groups allowed to take a course.
@@ -282,16 +254,18 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
                 else:
                     allowed += 1
             return allowed
+        classes.sort(key=lambda x: sections[x.section_id].size)
         classes.sort(key=lambda x: count_allowed(sections[x.section_id]))
 
         # TODO: take program-year size and section capacity into account
         program_alloc = {}
         for section in classes:
+            section_data = sections[section.section_id]
+
             # sum section capacities and subtract allocation later. anything left is overallocation
-            overallocated += 1  # TODO: replace 1 with section size, i think
+            overallocated += section_data.size
 
             # only consider programs/years that this section is restricted to
-            section_data = sections[section.section_id]
             for restriction in section_data.restrictions:
                 if restriction.year is None:
                     for program_year, count in program_sizes.items():
@@ -313,20 +287,29 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
         for section in classes:
             section_data = sections[section.section_id]
 
+            unallocated = section_data.size
             for restriction in section_data.restrictions:
                 if program_alloc[restriction] > 0:
-                    # TODO: subtract section size instead of 1
-                    program_alloc[restriction] -= 1
-                    overallocated -= 1
-                    break
+                    if program_alloc[restriction] <= unallocated:
+                        unallocated -= program_alloc[restriction]
+                        overallocated -= program_alloc[restriction]
+                        program_alloc[restriction] = 0
+                    else:
+                        program_alloc[restriction] -= unallocated
+                        overallocated -= unallocated
+                        break
 
             if not section_data.restrictions:
                 for program_year, size in program_alloc.items():
                     if size > 0:
-                        # TODO: subtract section size
-                        program_alloc[program_year] -= 1
-                        overallocated -= 1
-                        break
+                        if size <= unallocated:
+                            unallocated -= size
+                            overallocated -= size
+                            program_alloc[program_year] = 0
+                        else:
+                            program_alloc[program_year] -= unallocated
+                            overallocated -= unallocated
+                            break
 
     # soft constraint fitness (penalty. minimize)
     soft_penalty = soft_fitness(individual, sections)
@@ -393,7 +376,6 @@ def soft_fitness(individual, sections):
     return gap_length + consecutive_penalty
 
 
-# TODO: think of a better way to mutate. shifting by 1 timeslot seems to cause stagnation
 def mut_timetable(ind, sections, rooms, faculty):
     """Mutate a timetable.
 
@@ -518,7 +500,7 @@ def main():
 
     program_sizes = {}
     for program_year in plans:
-        program_sizes[program_year] = 1
+        program_sizes[program_year] = 2
 
     classes = []
     for course in plans.values():
@@ -534,7 +516,10 @@ def main():
             blocks.update(range(day, day + 10))
             blocks.update(range(day + 12, day + 22))
         # randomly choose between 2 or 3 max consecutive sessions
-        faculty.append(Instructor(name=i, avail=blocks, max_consecutive=random.choice((2, 3))))
+        faculty.append(Instructor(
+            name=i,
+            avail=blocks,
+            max_consecutive=random.choice((2, 3))))
 
     # dummy section table. a section is an instance of a course
     sections = []
@@ -550,13 +535,16 @@ def main():
                     restrictions.append(Restriction(program=p, year=year))
 
             is_twice_weekly = random.random() > 0.2
-            section = Section(
-                course,
-                section_number,
-                faculty[faculty_assigned // 3],
-                3 if is_twice_weekly else 6,
-                restrictions,
-                is_twice_weekly)
+            args = {
+                'course': course,
+                'id_': section_number,
+                'instructor': faculty[faculty_assigned // 3],
+                'length': 3 if is_twice_weekly else 6,
+                'size': 2,
+                'restrictions': restrictions,
+                'is_twice_weekly': is_twice_weekly
+            }
+            section = Section(**args)
             sections.append(section)
             faculty_assigned += 1
 
@@ -570,11 +558,14 @@ def main():
         else:
             once += 1
     # i did the math, ok? don't worry about it, it's just dummy data
+    # 16 for double classes. 4 per day not counting wed
+    # 2 for single classes. 2 on wed only
+    # TODO: replace with hardcoded test database generator
     rooms_needed = math.ceil(max(twice / 16, once / 2) / len(programs))
     room_number = 0
     for program in programs:
         for _ in range(rooms_needed):
-            rooms.append(Room(name=room_number, category=program))
+            rooms.append(Room(name=room_number, capacity=2, category=program))
             room_number += 1
 
     validate_faculty_load(faculty, sections)
@@ -584,7 +575,8 @@ def main():
 
     toolbox = base.Toolbox()
     toolbox.register("ind", gen_ind, sections=sections, rooms=rooms)
-    toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.ind)
+    toolbox.register(
+        "individual", tools.initIterate, creator.Individual, toolbox.ind)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
     toolbox.register("evaluate", eval_timetable,

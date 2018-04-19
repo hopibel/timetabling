@@ -1,7 +1,7 @@
 """Dummy study plan generator."""
 
 import random
-from timetabling import Course, WildcardCourse
+from timetabling import Course, NonmajorCourse
 
 
 def generate_study_plans(programs):
@@ -13,6 +13,13 @@ def generate_study_plans(programs):
     plans = {}
     for program in programs:
         for year in range(1, 5):
-            plans[(program, year)] = set([WildcardCourse('shared-{}{}'.format(year, shared)) for shared in 'ab'])
-            plans[(program, year)].update([Course('{}-{}{}'.format(program, year, major), random.choice([program, None])) for major in 'abcd'])
+            plans[(program, year)] = set([
+                NonmajorCourse('shared-{}{}'.format(year, shared))
+                for shared
+                in 'ab'])
+            plans[(program, year)].update([
+                Course('{}-{}{}'.format(program, year, major),
+                       random.choice([program, None]))
+                for major
+                in 'abcd'])
     return plans

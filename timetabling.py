@@ -84,30 +84,30 @@ class Course(object):
         return self.name == course.name
 
     @staticmethod
-    def is_wildcard():
-        """Return whether this a wildcard."""
+    def is_nonmajor():
+        """Return whether this a nonmajor course."""
         return False
 
     def __hash__(self):
-        return hash((self.name, self.is_wildcard()))
+        return hash((self.name, self.is_nonmajor()))
 
     def __eq__(self, other):
-        return self.name == other.name and self.is_wildcard() == other.is_wildcard()
+        return self.name == other.name and self.is_nonmajor() == other.is_nonmajor()
 
 
-class WildcardCourse(Course):
+class NonmajorCourse(Course):
     """
-    Wildcard course for GEs and Electives. Matches any GE or elective in a study plan.
+    Nonmajor course for GEs and Electives. Matches any GE or elective in a study plan.
 
     All GE types and Electives are treated as one category.
     GEs are numerous enough that mutual exclusion is unlikely.
-    Electives often have restrictions which take effect before wildcards.
+    Electives often have restrictions which take effect before Nonmajors.
     """
     def matches(self, course):
-        return course.is_wildcard() or self.name == course.name
+        return course.is_nonmajor() or self.name == course.name
 
     @staticmethod
-    def is_wildcard():
+    def is_nonmajor():
         return True
 
 

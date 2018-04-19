@@ -23,8 +23,10 @@ CREATE TABLE room_types(
 c.execute("""
 CREATE TABLE courses(
     name text NOT NULL,
+    room_type text,
     is_nonmajor tinyint NOT NULL,
     PRIMARY KEY (name),
+    FOREIGN KEY (room_type) REFERENCES room_types(name),
     CHECK (is_nonmajor BETWEEN 0 AND 1)
 )""")
 
@@ -84,13 +86,11 @@ CREATE TABLE sections(
     course text NOT NULL,
     section_id text NOT NULL,
     instructor text NOT NULL,
-    room_type text,
     length int NOT NULL,
     size int NOT NULL,
     is_twice_weekly int NOT NULL,
     FOREIGN KEY (course) REFERENCES courses(name),
     FOREIGN KEY (instructor) REFERENCES instructors(name),
-    FOREIGN KEY (room_type) REFERENCES room_types(name)
     CHECK (length > 0),
     CHECK (size > 0)
 )""")

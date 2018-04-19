@@ -6,11 +6,13 @@ import pprint
 import random
 from collections import Counter, namedtuple
 import math
+import sqlite3
 import numpy
 from deap import algorithms, base, creator, tools
 import plan_gen
 import to_html
 
+DAY_START_TIME = 600
 DAY_SLOTS = 28
 SLOTS = DAY_SLOTS * 5
 
@@ -433,6 +435,7 @@ def mut_timetable(ind, sections, rooms, faculty):
         """
         valid_slots = get_valid_slots()
         section.slot = random.choice(valid_slots)
+        change_room()
 
     def change_room():
         """Change a course's room assignment."""
@@ -449,7 +452,7 @@ def mut_timetable(ind, sections, rooms, faculty):
 
 def validate_faculty_load(faculty, sections):
     # check if faculty have enough contiguous blocks for each class
-    for instructor in faculty:
+    for instructor in faculty.values():
         avail_length = []
         block_list = list(instructor.avail)
         block_list.sort()
@@ -488,85 +491,94 @@ def validate_faculty_load(faculty, sections):
                 j += 1
 
 
+def day_time_to_slot(day, time):
+    """
+    Calculate slot based on integer representing 24 hour time format.
+    """
+    slot = (day - 1) * DAY_SLOTS
+    slot += (time - DAY_START_TIME) // 100 * 2
+    slot += (time % 100) // 30
+    return slot
+
+
 def main():
     """Entry point if called as executable."""
 
-    random.seed('feffy')
+    # set up database connection
+    conn = sqlite3.connect('database.sqlite3')
+    c = conn.cursor()
 
-    # dummy study plans (only used to generate classes right now)
-    programs = ['CS', 'Bio', 'Stat']
-#    programs = ['CS']
-    plans = plan_gen.generate_study_plans(programs)
-
-    program_sizes = {}
-    for program_year in plans:
-        program_sizes[program_year] = 2
-
-    classes = []
-    for course in plans.values():
-        classes.extend(course)
-    class_counts = Counter(classes)
-
-    # generate teachers with availability of 20 timeslots per day split into morning and afternoon
-    faculty = []
-    for i in range(math.ceil(len(classes) / 3)):
-        blocks = set()
-        for day in range(5):
-            day *= DAY_SLOTS
-            blocks.update(range(day, day + 10))
-            blocks.update(range(day + 12, day + 22))
-        # randomly choose between 2 or 3 max consecutive sessions
-        faculty.append(Instructor(
-            name=i,
-            avail=blocks,
-            max_consecutive=random.choice((2, 3))))
-
-    # dummy section table. a section is an instance of a course
-    sections = []
-    faculty_assigned = 0
-    for course in class_counts.keys():
-        for section_number in range(1, class_counts[course]+1):
-            # store restrictions as list of namedtuples with program and year
-            # setting program or year to None acts as wildcard
-            restrictions = []
-            year = int(course.name[course.name.index('-')+1])
-            for p in programs:
-                if course.name.startswith(p):
-                    restrictions.append(Restriction(program=p, year=year))
-
-            is_twice_weekly = random.random() > 0.2
-            args = {
-                'course': course,
-                'id_': section_number,
-                'instructor': faculty[faculty_assigned // 3],
-                'length': 3 if is_twice_weekly else 6,
-                'size': 2,
-                'restrictions': restrictions,
-                'is_twice_weekly': is_twice_weekly
-            }
-            section = Section(**args)
-            sections.append(section)
-            faculty_assigned += 1
-
-    # dummy room list
-    rooms = []
-    twice = 0
-    once = 0
-    for section in sections:
-        if section.is_twice_weekly:
-            twice += 1
+    # import courses
+    courses = {}
+    for name, room_type, is_nonmajor in c.execute('select * from courses'):
+        if is_nonmajor:
+            courses[name] = NonmajorCourse(name, room_type)
         else:
-            once += 1
-    # i did the math, ok? don't worry about it, it's just dummy data
-    # 16 for double classes. 4 per day not counting wed
-    # 2 for single classes. 2 on wed only
-    # TODO: replace with hardcoded test database generator
-    rooms_needed = math.ceil(max(twice / 16, once / 2) / len(programs))
-    room_number = 0
-    for program in programs:
-        for _ in range(rooms_needed):
-            rooms.append(Room(name=room_number, capacity=2, category=program))
-            room_number += 1
+            courses[name] = Course(name, room_type)
+
+    # import study plans
+    plans = {}
+    for program, year, course in c.execute('select * from study_plans'):
+        if (program, year) not in plans:
+            plans[(program, year)] = set()
+        plans[(program, year)].add(courses[course])
+
+    # import program sizes
+    program_sizes = {}
+    for program, year, size in c.execute('select * from program_sizes'):
+        program_sizes[(program, year)] = size
+
+    # import instructor availability times
+    availabilities = {}
+    for instructor, day, start, end in c.execute('select * from availability'):
+        if instructor not in availabilities:
+            availabilities[instructor] = set()
+
+        availabilities[instructor].update(range(
+            day_time_to_slot(day, start),
+            day_time_to_slot(day, end),
+        ))
+
+    # import instructors
+    faculty = {}
+    for name, max_consecutive in c.execute('select * from instructors'):
+        faculty[name] = Instructor(name, availabilities[name], max_consecutive)
+
+    # import restrictions
+    restrictions = {}
+    for section, program, year in c.execute('select * from restrictions'):
+        if section not in restrictions:
+            restrictions[section] = []
+        restrictions[section].append(Restriction(program, year))
+
+    # import sections
+    sections = []
+    query = """
+        select
+            rowid,
+            course,
+            section_id,
+            instructor,
+            length,
+            size,
+            is_twice_weekly
+        from sections
+        """
+    for row in c.execute(query):
+        rowid, course, id_, instructor, length, size, is_twice_weekly = row
+        sections.append(Section(
+            courses[course],
+            id_,
+            faculty[instructor],
+            length,
+            size,
+            restrictions.get(rowid, []),
+            is_twice_weekly
+        ))
+
+    rooms = []
+    for name, capacity, category in c.execute('select * from rooms'):
+        rooms.append(Room(name, capacity, category))
 
     validate_faculty_load(faculty, sections)
 
@@ -592,12 +604,13 @@ def main():
 
     ngen = 100  # generations
     mu = 100  # population size
-    lambd = mu  # offspring to create
+    lambda_ = mu  # offspring to create
     cxpb = 0.7  # crossover probability
     mutpb = 0.2  # mutation probability
 
     pop = toolbox.population(n=mu)
-    hof = tools.ParetoFront()
+    # hof = tools.ParetoFront()  # causes memory ballooning
+    hof = None
     stats = tools.Statistics(key=lambda ind: ind.fitness.values)
     stats.register("avg", numpy.mean, axis=0)
     stats.register("std", numpy.std, axis=0)
@@ -606,7 +619,16 @@ def main():
 
     try:
         eaMuPlusLambda(
-            pop, toolbox, mu, lambd, cxpb, mutpb, ngen, stats=stats, halloffame=hof, verbose=True)
+            pop,
+            toolbox,
+            mu,
+            lambda_,
+            cxpb,
+            mutpb,
+            ngen,
+            stats=stats,
+            halloffame=hof,
+            verbose=True)
     except KeyboardInterrupt:
         pass
 

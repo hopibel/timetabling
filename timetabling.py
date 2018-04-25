@@ -4,12 +4,17 @@ import sys
 import pprint
 
 import random
-from collections import Counter, namedtuple
-import math
 import sqlite3
 import numpy
-from deap import algorithms, base, creator, tools
-import plan_gen
+
+from collections import namedtuple, deque
+from multiprocessing import Event, Pipe, Process
+
+from deap import algorithms
+from deap import base
+from deap import creator
+from deap import tools
+
 import to_html
 
 DAY_START_TIME = 600
@@ -501,6 +506,43 @@ def day_time_to_slot(day, time):
     return slot
 
 
+def mig_pipe(deme, k, pipe_in, pipe_out, selection, replacement=None):
+    """Migration using pipes between processes. It first selects
+    *k* individuals from the *deme* and writes them in *pipe_out*. Then it
+    reads the individuals from *pipe_in* and replaces some individuals in
+    the deme. The *replacement* function must sample without repetition.
+
+    Parameters
+    ----------
+    deme : list of individuals
+    k : int
+        Number of individuals to migrate.
+    pipe_in : multiprocessing.Pipe
+        Pipe from which to read immigrants.
+    pipe_out : multiprocessing.Pipe
+        Pipe in which to write emigrants.
+    selection : function
+        Function to use for selecting emigrants.
+    replacement : function
+        Function to select individuals to replace with immigrants.
+        If set to None immigrants directly replace emigrants.
+    """
+    emigrants = selection(deme, k)
+    if replacement is None:
+        # If no replacement strategy is selected, replace those who migrate
+        immigrants = emigrants
+    else:
+        # otherwise select those who will be replaced
+        immigrants = replacement(deme, k)
+
+    pipe_out.send(emigrants)
+    buf = pipe_in.recv()
+
+    for place, immigrant in zip(immigrants, buf):
+        i = deme.index(place)
+        deme[i] = immigrant
+
+
 def main():
     """Entry point if called as executable."""
 
@@ -602,37 +644,57 @@ def main():
                      faculty=faculty)
     toolbox.register('select', tools.selNSGA2, nd='log')
 
-    ngen = 100  # generations
-    mu = 100  # population size
-    lambda_ = mu  # offspring to create
-    cxpb = 0.7  # crossover probability
-    mutpb = 0.2  # mutation probability
+    # set to number of available threads
+    NBR_DEMES = 8
 
-    pop = toolbox.population(n=mu)
-    # hof = tools.ParetoFront()  # causes memory ballooning
-    hof = None
-    stats = tools.Statistics(key=lambda ind: ind.fitness.values)
-    stats.register("avg", numpy.mean, axis=0)
-    stats.register("std", numpy.std, axis=0)
-    stats.register("min", numpy.min, axis=0)
-    stats.register("max", numpy.max, axis=0)
+    # set up migration pipes in ring topology
+    pipes = [Pipe(False) for _ in range(NBR_DEMES)]
+    pipes_in = deque(p[0] for p in pipes)
+    pipes_out = deque(p[1] for p in pipes)
+    pipes_in.rotate(1)
+    pipes_out.rotate(-1)
 
-    # TODO: save state before exiting
-    try:
-        pop, logbook = evolve(pop, toolbox, mu, lambda_, cxpb, mutpb, ngen,
-                              stats=stats, halloffame=hof, verbose=True)
-    except KeyboardInterrupt:
-        pass
+    e = Event()
 
-    solution = sel_best(pop)
-    print(eval_timetable(solution, sections, program_sizes, plans))
+    processes = [
+        Process(target=mp_evolve,
+                args=(toolbox, i, ipipe, opipe, e, random.random(), True))
+        for i, (ipipe, opipe)
+        in enumerate(zip(pipes_in, pipes_out))
+    ]
 
-    # TODO: replace with matplotlib graph and sqlite export
-    to_html.to_html(solution, sections, SLOTS, DAY_SLOTS)
+    for proc in processes:
+        proc.start()
+
+    for proc in processes:
+        proc.join()
+
+    # TODO: use a multiprocessing.Queue to collect final populations
+    # # TODO: save state before exiting
+    # try:
+    #     pop, logbook = evolve(pop, toolbox, mu, lambda_, cxpb, mutpb, ngen,
+    #                           stats=stats, halloffame=hof, verbose=True)
+    # except KeyboardInterrupt:
+    #     pass
+
+    # solution = sel_best(pop)
+    # print(eval_timetable(solution, sections, program_sizes, plans))
+
+    # # TODO: replace with matplotlib graph and sqlite export
+    # to_html.to_html(solution, sections, SLOTS, DAY_SLOTS)
 
 
-def evolve(population, toolbox, mu, lambda_, cxpb, mutpb, ngen,
-           stats=None, halloffame=None, verbose=__debug__):
+# TODO: implement random restart to deal with local optima
+# problem: how do we decide that a population is stuck on local optimum?
+# take minimums of all fitness functions. restart with elitism if mins haven't
+# changed in a certain number of generations
+# relevant paper:
+# Dao, S. D., Abhary, K., & Marian, R. (2015, October).
+# An adaptive restarting genetic algorithm for global optimization.
+# In Proceedings of the World Congress on Engineering and Computer
+# Science (Vol. 1).
+def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, seed=None,
+              verbose=__debug__):
     """Evolve timetables with the (mu + lambda) evolutionary algorithm.
     The next generation is selected from a pool of previous population
     mu + offspring population lambda.
@@ -641,86 +703,101 @@ def evolve(population, toolbox, mu, lambda_, cxpb, mutpb, ngen,
 
     Parameters
     ----------
-    population : list of individuals
     toolbox : deap.base.Toolbox
         Contains the evolution operators.
-    mu : int
-        Number of individuals to select for the next generation.
-    lambda : int
-        Number of offspring to produce at each generation.
-    cxpb : float
-        Probability that an offspring is produced by crossover.
-    mutpb : float
-        Probability that an offspring is produced by mutation.
-    ngen : int
-        Number of generations.
-    stats : deap.tools.Statistics, optional
-        Saves statistics about the population.
-    halloffame : deap.tools.HallOfFame, optional
-        Will contain best individuals.
+    procid : int
+        process ID
+    pipe_in : multiprocessing.Pipe
+        Pipe for immigrants.
+    pip_out : multiprocessing.Pipe
+        Pipe for emigrants.
+    sync : multiprocessing.Event
+        Synchronization channel.
+    seed : random seed
     verbose : bool
         Whether or not to log the statistics to stdout.
 
     Returns
     -------
-    list
-        The final population.
-    deap.tools.Logbook
-        Log of the statistics of the evolution.
+    TODO: output final generation to a Queue
     """
 
+    # start each deme with a different seed
+    random.seed(seed)
+    toolbox.register("migrate", mig_pipe, k=5, pipe_in=pipe_in,
+                     pipe_out=pipe_out, selection=tools.selNSGA2,
+                     replacement=random.sample)
+
+    NGEN = 100
+    MU = 100
+    LAMBDA = MU
+    CXPB = 0.6
+    MUTPB = 0.4
+    MIG_RATE = 5
+
+    deme = toolbox.population(n=MU)
+    hof = None
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", numpy.mean, axis=0)
+    stats.register("std", numpy.std, axis=0)
+    stats.register("min", numpy.min, axis=0)
+    stats.register("max", numpy.max, axis=0)
+
     logbook = tools.Logbook()
-    logbook.header = ['gen', 'nevals'] + (stats.fields if stats else [])
+    logbook.header = ('gen', 'deme', 'evals', 'std', 'min', 'avg', 'max')
 
     # Evaluate the individuals with an invalid fitness
-    invalid_ind = [ind for ind in population if not ind.fitness.valid]
+    invalid_ind = [ind for ind in deme if not ind.fitness.valid]
     fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
     for ind, fit in zip(invalid_ind, fitnesses):
         ind.fitness.values = fit
 
-    if halloffame is not None:
-        halloffame.update(population)
+    record = stats.compile(deme) if stats is not None else {}
+    logbook.record(gen=0, deme=procid, evals=len(invalid_ind), **record)
+    if hof is not None:
+        hof.update(deme)
 
-    record = stats.compile(population) if stats is not None else {}
-    logbook.record(gen=0, nevals=len(invalid_ind), **record)
     if verbose:
-        print(logbook.stream)
-
-    # Return early if an individual has fitness (0, 0, 0)
-    for ind in population:
-        if not any(ind.fitness.values):
-            return population, logbook
+        if procid == 0:
+            # Synchronization needed to log header on top exactly once
+            print(logbook.stream)
+            sync.set()
+        else:
+            logbook.log_header = False  # never output the header
+            sync.wait()
+            print(logbook.stream)
 
     # Begin the generational process
     # Stop on perfect solution or ngen reached
-    for gen in range(1, ngen + 1):
+    for gen in range(1, NGEN + 1):
         # Vary the population
-        offspring = algorithms.varOr(population, toolbox, lambda_, cxpb, mutpb)
+        offspring = algorithms.varOr(deme, toolbox, LAMBDA, CXPB, MUTPB)
 
-        # Evaluat the individuals with an invalid fitness
+        # Evaluate the individuals with an invalid fitness
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
         fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
         for ind, fit in zip(invalid_ind, fitnesses):
             ind.fitness.values = fit
 
         # Update the hall of fame with the generated individuals
-        if halloffame is not None:
-            halloffame.update(offspring)
+        if hof is not None:
+            hof.update(offspring)
 
         # Select the next generation population
-        population[:] = toolbox.select(population + offspring, mu)
+        deme[:] = toolbox.select(deme + offspring, MU)
 
         # Update the statistics with the new population
-        record = stats.compile(population) if stats is not None else {}
-        logbook.record(gen=gen, nevals=len(invalid_ind), **record)
+        record = stats.compile(deme) if stats is not None else {}
+        logbook.record(gen=gen, deme=procid, evals=len(invalid_ind), **record)
         if verbose:
             print(logbook.stream)
 
-        for ind in invalid_ind:
-            if not any(ind.fitness.values):
-                break
+        # perform migration every MIG_RATE generations
+        if gen % MIG_RATE == 0 and gen > 0:
+            toolbox.migrate(deme)
 
-    return population, logbook
+    # TODO return final population to an output Queue
+    # return deme, logbook
 
 
 def sel_best(population):

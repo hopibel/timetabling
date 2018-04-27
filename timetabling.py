@@ -17,10 +17,9 @@ from deap import tools
 
 import to_html
 
-DAY_START_TIME = 600
-DAY_SLOTS = 28
+DAY_START_TIME = 0
+DAY_SLOTS = 48
 SLOTS = DAY_SLOTS * 5
-
 
 Room = namedtuple('Room', ['name', 'capacity', 'category'])
 Restriction = namedtuple('Restriction', ['program', 'year'])
@@ -193,7 +192,7 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
 
     Currently calculates:
     Number of overlapping classes
-    Excess classes in a timeslot (overallocation)
+    Excess classes in a timeslot (overallocation/density)
     """
     overlap = 0
 
@@ -264,7 +263,6 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
         classes.sort(key=lambda x: sections[x.section_id].size)
         classes.sort(key=lambda x: count_allowed(sections[x.section_id]))
 
-        # TODO: take program-year size and section capacity into account
         program_alloc = {}
         for section in classes:
             section_data = sections[section.section_id]
@@ -547,7 +545,7 @@ def main():
     """Entry point if called as executable."""
 
     # set up database connection
-    conn = sqlite3.connect('database.sqlite3')
+    conn = sqlite3.connect('database_small.sqlite3')
     c = conn.cursor()
 
     # import courses
@@ -644,8 +642,8 @@ def main():
                      faculty=faculty)
     toolbox.register('select', tools.selNSGA2, nd='log')
 
-    # set to number of available threads
-    NBR_DEMES = 8
+    # number of processes to run in parallel
+    NBR_DEMES = 4
 
     # set up migration pipes in ring topology
     pipes = [Pipe(False) for _ in range(NBR_DEMES)]
@@ -722,29 +720,36 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, seed=None,
     TODO: output final generation to a Queue
     """
 
+    NGEN = 500          # number of generations
+    MU = 50             # population size
+    LAMBDA = MU         # number of offspring to generate each gen
+    CXPB = 0.75         # crossover probability
+    MUTPB = 0.25        # mutation probability
+    MIG_RATE = 5        # migration rate (generations)
+    MIG_K = 5           # number of individuals migrated
+    RR_THRESH = 50      # random restart if no improvement/stagnated
+    RR_KEEP = 5         # keep the best individuals during a restart
+    CHKPOINT = 50       # checkpoint frequency
+
     # start each deme with a different seed
     random.seed(seed)
-    toolbox.register("migrate", mig_pipe, k=5, pipe_in=pipe_in,
+    toolbox.register("migrate", mig_pipe, k=MIG_K, pipe_in=pipe_in,
                      pipe_out=pipe_out, selection=tools.selNSGA2,
                      replacement=random.sample)
 
-    NGEN = 100
-    MU = 100
-    LAMBDA = MU
-    CXPB = 0.6
-    MUTPB = 0.4
-    MIG_RATE = 5
-
     deme = toolbox.population(n=MU)
-    hof = None
+    hof = tools.HallOfFame(maxsize=1)
     stats = tools.Statistics(lambda ind: ind.fitness.values)
     stats.register("avg", numpy.mean, axis=0)
     stats.register("std", numpy.std, axis=0)
     stats.register("min", numpy.min, axis=0)
     stats.register("max", numpy.max, axis=0)
 
+    # TODO: pickle and checkpoint regularly
+    # TODO: save logbooks until we have matplotlib output
+    # TODO: argparse optional --continue
     logbook = tools.Logbook()
-    logbook.header = ('gen', 'deme', 'evals', 'std', 'min', 'avg', 'max')
+    logbook.header = ('gen', 'deme', 'nevals', 'std', 'min', 'avg', 'max')
 
     # Evaluate the individuals with an invalid fitness
     invalid_ind = [ind for ind in deme if not ind.fitness.valid]
@@ -753,7 +758,7 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, seed=None,
         ind.fitness.values = fit
 
     record = stats.compile(deme) if stats is not None else {}
-    logbook.record(gen=0, deme=procid, evals=len(invalid_ind), **record)
+    logbook.record(gen=0, deme=procid, nevals=len(invalid_ind), **record)
     if hof is not None:
         hof.update(deme)
 
@@ -767,8 +772,9 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, seed=None,
             sync.wait()
             print(logbook.stream)
 
+    previous_best = hof[0].fitness.values
+
     # Begin the generational process
-    # Stop on perfect solution or ngen reached
     for gen in range(1, NGEN + 1):
         # Vary the population
         offspring = algorithms.varOr(deme, toolbox, LAMBDA, CXPB, MUTPB)
@@ -788,35 +794,39 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, seed=None,
 
         # Update the statistics with the new population
         record = stats.compile(deme) if stats is not None else {}
-        logbook.record(gen=gen, deme=procid, evals=len(invalid_ind), **record)
+        logbook.record(gen=gen, deme=procid, nevals=len(invalid_ind), **record)
         if verbose:
             print(logbook.stream)
 
         # perform migration every MIG_RATE generations
-        if gen % MIG_RATE == 0 and gen > 0:
+        if gen % MIG_RATE == 0:
             toolbox.migrate(deme)
+
+        # random restart if best solution hasn't improved (stagnation)
+        if gen % RR_THRESH == 0:
+            if not hof[0].fitness.values < previous_best:
+                # save best of current population and generate a new one
+                elite = toolbox.select(deme, RR_KEEP)
+                new_pop = toolbox.population(n=MU-len(elite))
+
+                # evaluate fitnesses of new population
+                invalid_ind = [ind for ind in new_pop if not ind.fitness.valid]
+                fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+                for ind, fit in zip(invalid_ind, fitnesses):
+                    ind.fitness.values = fit
+
+                if hof is not None:
+                    hof.update(new_pop)
+
+                # update population
+                deme[:] = new_pop + elite
+            else:
+                previous_best = hof[0].fitness.values
+
+    print(hof[0].fitness.values)
 
     # TODO return final population to an output Queue
     # return deme, logbook
-
-
-def sel_best(population):
-    """Select individual with lowest total hard penalty with soft
-    penalty as tiebreaker.
-    """
-    best = population[0]
-    best_penalty = sum(best.fitness.values[:-1])
-    for ind in population:
-        hard_penalty = sum(ind.fitness.values[:-1])
-        if hard_penalty < best_penalty:
-            best = ind
-            best_penalty = hard_penalty
-        elif hard_penalty == best_penalty:
-            if ind.fitness.values[-1] < best.fitness.values[-1]:
-                best = ind
-                best_penalty = hard_penalty
-
-    return best
 
 
 if __name__ == '__main__':

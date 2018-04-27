@@ -105,3 +105,4 @@ venv.bak/
 
 room_sched.html
 database.sqlite3
+database_small.sqlite3

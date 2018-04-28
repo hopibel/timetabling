@@ -3,8 +3,10 @@
 import sys
 import pprint
 
+import argparse
 import random
 import sqlite3
+import pickle
 import numpy
 import matplotlib.pyplot as plt
 
@@ -542,11 +544,32 @@ def mig_pipe(deme, k, pipe_in, pipe_out, selection, replacement=None):
         deme[i] = immigrant
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("pop", help="population size per deme", type=int)
+    parser.add_argument("gens", help="number of generations", type=int)
+    parser.add_argument("-r", "--runs", help="average results over multiple runs",
+                        type=int, default=1)
+    parser.add_argument("-c", "--continue", help="result from last checkpoint",
+                        action='store_true')
+    parser.add_argument("-d", "--database",
+                        help="sqlite3 database to use",
+                        type=str, default='database.sqlite3')
+    parser.add_argument("-o", "--out", help="output file prefix for graphs and timetable",
+                        default="output")
+    parser.add_argument("-v", "--verbose", help="log per-generation stats to console",
+                        action='store_true')
+
+    return parser.parse_args()
+
+
 def main():
     """Entry point if called as executable."""
 
+    args = parse_args()
+
     # set up database connection
-    conn = sqlite3.connect('database_small.sqlite3')
+    conn = sqlite3.connect(args.database)
     c = conn.cursor()
 
     # import courses
@@ -646,61 +669,102 @@ def main():
     # number of processes to run in parallel
     NBR_DEMES = 4
 
-    # set up migration pipes in ring topology
-    pipes = [Pipe(False) for _ in range(NBR_DEMES)]
-    pipes_in = deque(p[0] for p in pipes)
-    pipes_out = deque(p[1] for p in pipes)
-    pipes_in.rotate(1)
-    pipes_out.rotate(-1)
+    # perform multiple runs and average the results
+    run_hard = {
+        'min': [],
+        'avg': [],
+        'max': [],
+    }
+    run_soft = {
+        'min': [],
+        'avg': [],
+        'max': [],
+    }
+    for run in range(1, args.runs+1):
+        print("Started run {}/{}".format(run, args.runs))
 
-    e = Event()
-    out_queue = Queue()
+        # set up migration pipes in ring topology
+        pipes = [Pipe(False) for _ in range(NBR_DEMES)]
+        pipes_in = deque(p[0] for p in pipes)
+        pipes_out = deque(p[1] for p in pipes)
+        pipes_in.rotate(1)
+        pipes_out.rotate(-1)
 
-    processes = [
-        Process(target=mp_evolve,
-                args=(toolbox, i, ipipe, opipe, e, out_queue, random.random(), True))
-        for i, (ipipe, opipe)
-        in enumerate(zip(pipes_in, pipes_out))
-    ]
+        e = Event()
+        out_queue = Queue()
 
-    for proc in processes:
-        proc.start()
+        processes = [
+            Process(target=mp_evolve,
+                    args=(toolbox.population(args.pop), args.gens, toolbox,
+                          i, ipipe, opipe, e, out_queue, random.random(), args.verbose))
+            for i, (ipipe, opipe)
+            in enumerate(zip(pipes_in, pipes_out))
+        ]
 
-    results = []
-    for i in range(NBR_DEMES):
-        results.append(out_queue.get())
+        for proc in processes:
+            proc.start()
 
-    for proc in processes:
-        proc.join()
+        results = []
+        for i in range(NBR_DEMES):
+            results.append(out_queue.get())
 
-    # need multiple graphs for multi-objective problem
-    gen = results[0]['logbook'].select('gen')
-    hard_min = []
-    hard_avg = []
-    hard_max = []
+        for proc in processes:
+            proc.join()
 
-    soft_min = []
-    soft_avg = []
-    soft_max = []
-    for r in results:
-        log = r['logbook']
-        hard_min.append(numpy.array(log.select('min'))[:, 0])
-        hard_avg.append(numpy.array(log.select('avg'))[:, 0])
-        hard_max.append(numpy.array(log.select('max'))[:, 0])
+        print("Collecting run {} statistics".format(run))
 
-        soft_min.append(numpy.array(log.select('min'))[:, 1])
-        soft_avg.append(numpy.array(log.select('min'))[:, 1])
-        soft_max.append(numpy.array(log.select('min'))[:, 1])
+        # need multiple graphs for multi-objective problem
+        gen = results[0]['logbook'].select('gen')
+        hard_min = []
+        hard_avg = []
+        hard_max = []
 
-    # combine results from each deme
-    hard_min = numpy.min(hard_min, axis=0)
-    hard_avg = numpy.mean(hard_avg, axis=0)
-    hard_max = numpy.max(hard_max, axis=0)
+        soft_min = []
+        soft_avg = []
+        soft_max = []
+        for r in results:
+            log = r['logbook']
+            hard_min.append(numpy.array(log.select('min'))[:, 0])
+            hard_avg.append(numpy.array(log.select('avg'))[:, 0])
+            hard_max.append(numpy.array(log.select('max'))[:, 0])
 
-    soft_min = numpy.min(soft_min, axis=0)
-    soft_avg = numpy.mean(soft_avg, axis=0)
-    soft_max = numpy.max(soft_max, axis=0)
+            soft_min.append(numpy.array(log.select('min'))[:, 1])
+            soft_avg.append(numpy.array(log.select('avg'))[:, 1])
+            soft_max.append(numpy.array(log.select('max'))[:, 1])
 
+        # combine results from each deme
+        hard_min = numpy.min(hard_min, axis=0)
+        hard_avg = numpy.mean(hard_avg, axis=0)
+        hard_max = numpy.max(hard_max, axis=0)
+
+        soft_min = numpy.min(soft_min, axis=0)
+        soft_avg = numpy.mean(soft_avg, axis=0)
+        soft_max = numpy.max(soft_max, axis=0)
+
+        # save run results
+        run_hard['min'].append(hard_min)
+        run_hard['avg'].append(hard_avg)
+        run_hard['max'].append(hard_max)
+
+        run_soft['min'].append(soft_min)
+        run_soft['avg'].append(soft_avg)
+        run_soft['max'].append(soft_max)
+
+        # checkpoint run results since this'll take a while
+        results = dict(run_hard=run_hard, run_soft=run_soft)
+        with open('run_results.pkl', 'wb') as cp_file:
+            pickle.dump(results, cp_file)
+
+    # average results of all runs
+    hard_min = numpy.mean(numpy.array(run_hard['min']), axis=0)
+    hard_avg = numpy.mean(numpy.array(run_hard['avg']), axis=0)
+    hard_max = numpy.mean(numpy.array(run_hard['max']), axis=0)
+
+    soft_min = numpy.mean(numpy.array(run_soft['min']), axis=0)
+    soft_avg = numpy.mean(numpy.array(run_soft['avg']), axis=0)
+    soft_max = numpy.mean(numpy.array(run_soft['max']), axis=0)
+
+    # plot final averaged results
     fig, ax = plt.subplots(1, 2, figsize=plt.figaspect(0.4))
 
     ax[0].plot(gen, hard_min, 'g-', label='Minimum')
@@ -719,25 +783,14 @@ def main():
         axis.set_ylim(ymin=0)
         axis.legend()
 
-    plt.savefig('output.png')
-    plt.show()
+    plt.savefig('{}.png'.format(args.out))
 
-    # TODO: use a multiprocessing.Queue to collect final populations
     # # TODO: save state before exiting
-    # try:
-    #     pop, logbook = evolve(pop, toolbox, mu, lambda_, cxpb, mutpb, ngen,
-    #                           stats=stats, halloffame=hof, verbose=True)
-    # except KeyboardInterrupt:
-    #     pass
-
-    # solution = sel_best(pop)
-    # print(eval_timetable(solution, sections, program_sizes, plans))
-
     # # TODO: replace with matplotlib graph and sqlite export
     # to_html.to_html(solution, sections, SLOTS, DAY_SLOTS)
 
 
-def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
+def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
               verbose=__debug__):
     """Evolve timetables with the (mu + lambda) evolutionary algorithm.
     The next generation is selected from a pool of previous population
@@ -763,18 +816,18 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
     verbose : bool
         Whether or not to log the statistics to stdout.
     """
-    # TODO: output final generation to a Queue
 
-    NGEN = 20          # number of generations
-    MU = 100             # population size
+    NGEN = ngen         # number of generations
+    MU = len(pop)       # population size
     LAMBDA = MU         # number of offspring to generate each gen
-    CXPB = 0.6         # crossover probability
-    MUTPB = 0.4        # mutation probability
+    CXPB = 0.7          # crossover probability
+    MUTPB = 0.3         # mutation probability
     MIG_RATE = 5        # migration rate (generations)
     MIG_K = 5           # number of individuals migrated
     RR_THRESH = 50      # random restart if no improvement/stagnated
     RR_KEEP = 5         # keep the best individuals during a restart
     CHKPOINT = 50       # checkpoint frequency
+    LOG_RATE = 25       # hall of fame log frequency
 
     # start each deme with a different seed
     random.seed(seed)
@@ -782,7 +835,7 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
                      pipe_out=pipe_out, selection=tools.selNSGA2,
                      replacement=random.sample)
 
-    deme = toolbox.population(n=MU)
+    deme = pop
     hof = tools.HallOfFame(maxsize=1)
     stats = tools.Statistics(lambda ind: ind.fitness.values)
     stats.register("avg", numpy.mean, axis=0)
@@ -876,8 +929,10 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
             # update population
             deme[:] = new_pop + elite
 
-    # TODO return final population to an output Queue
-    # return deme, logbook
+        # log current hall of fame individual regularly
+        if gen % LOG_RATE == 0:
+            print("Deme {} best: {}".format(procid, hof[0].fitness.values))
+
     result = {
         'logbook': logbook,
         'population': deme,

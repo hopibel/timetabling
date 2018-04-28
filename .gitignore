@@ -104,5 +104,4 @@ venv.bak/
 .mypy_cache/
 
 room_sched.html
-database.sqlite3
-database_small.sqlite3
+database*.sqlite3

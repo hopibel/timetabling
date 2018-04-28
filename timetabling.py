@@ -6,9 +6,10 @@ import pprint
 import random
 import sqlite3
 import numpy
+import matplotlib.pyplot as plt
 
 from collections import namedtuple, deque
-from multiprocessing import Event, Pipe, Process
+from multiprocessing import Event, Pipe, Process, Queue
 
 from deap import algorithms
 from deap import base
@@ -319,7 +320,7 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
     # soft constraint fitness (penalty. minimize)
     soft_penalty = soft_fitness(individual, sections)
 
-    return (overlap, overallocated, soft_penalty)
+    return (overlap + overallocated, soft_penalty)
 
 
 def soft_fitness(individual, sections):
@@ -622,7 +623,7 @@ def main():
 
     validate_faculty_load(faculty, sections)
 
-    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0, -1.0))
+    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0))
     creator.create("Individual", list, fitness=creator.Fitness)
 
     toolbox = base.Toolbox()
@@ -635,7 +636,7 @@ def main():
                      sections=sections,
                      program_sizes=program_sizes,
                      study_plans=plans)
-    toolbox.register("mate", tools.cxOnePoint)
+    toolbox.register("mate", tools.cxTwoPoint)
     toolbox.register("mutate", mut_timetable,
                      sections=sections,
                      rooms=rooms,
@@ -653,10 +654,11 @@ def main():
     pipes_out.rotate(-1)
 
     e = Event()
+    out_queue = Queue()
 
     processes = [
         Process(target=mp_evolve,
-                args=(toolbox, i, ipipe, opipe, e, random.random(), True))
+                args=(toolbox, i, ipipe, opipe, e, out_queue, random.random(), True))
         for i, (ipipe, opipe)
         in enumerate(zip(pipes_in, pipes_out))
     ]
@@ -664,8 +666,61 @@ def main():
     for proc in processes:
         proc.start()
 
+    results = []
+    for i in range(NBR_DEMES):
+        results.append(out_queue.get())
+
     for proc in processes:
         proc.join()
+
+    # need multiple graphs for multi-objective problem
+    gen = results[0]['logbook'].select('gen')
+    hard_min = []
+    hard_avg = []
+    hard_max = []
+
+    soft_min = []
+    soft_avg = []
+    soft_max = []
+    for r in results:
+        log = r['logbook']
+        hard_min.append(numpy.array(log.select('min'))[:, 0])
+        hard_avg.append(numpy.array(log.select('avg'))[:, 0])
+        hard_max.append(numpy.array(log.select('max'))[:, 0])
+
+        soft_min.append(numpy.array(log.select('min'))[:, 1])
+        soft_avg.append(numpy.array(log.select('min'))[:, 1])
+        soft_max.append(numpy.array(log.select('min'))[:, 1])
+
+    # combine results from each deme
+    hard_min = numpy.min(hard_min, axis=0)
+    hard_avg = numpy.mean(hard_avg, axis=0)
+    hard_max = numpy.max(hard_max, axis=0)
+
+    soft_min = numpy.min(soft_min, axis=0)
+    soft_avg = numpy.mean(soft_avg, axis=0)
+    soft_max = numpy.max(soft_max, axis=0)
+
+    fig, ax = plt.subplots(1, 2, figsize=plt.figaspect(0.4))
+
+    ax[0].plot(gen, hard_min, 'g-', label='Minimum')
+    ax[0].plot(gen, hard_avg, 'b-', label='Average')
+    ax[0].plot(gen, hard_max, 'r-', label='Maximum')
+    ax[0].set_title('Hard constraints')
+
+    ax[1].plot(gen, soft_min, 'g-', label='Minimum')
+    ax[1].plot(gen, soft_avg, 'b-', label='Average')
+    ax[1].plot(gen, soft_max, 'r-', label='Maximum')
+    ax[1].set_title('Soft constraints')
+
+    for axis in ax:
+        axis.set_xlabel('Generation')
+        axis.set_ylabel('Fitness')
+        axis.set_ylim(ymin=0)
+        axis.legend()
+
+    plt.savefig('output.png')
+    plt.show()
 
     # TODO: use a multiprocessing.Queue to collect final populations
     # # TODO: save state before exiting
@@ -682,16 +737,7 @@ def main():
     # to_html.to_html(solution, sections, SLOTS, DAY_SLOTS)
 
 
-# TODO: implement random restart to deal with local optima
-# problem: how do we decide that a population is stuck on local optimum?
-# take minimums of all fitness functions. restart with elitism if mins haven't
-# changed in a certain number of generations
-# relevant paper:
-# Dao, S. D., Abhary, K., & Marian, R. (2015, October).
-# An adaptive restarting genetic algorithm for global optimization.
-# In Proceedings of the World Congress on Engineering and Computer
-# Science (Vol. 1).
-def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, seed=None,
+def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
               verbose=__debug__):
     """Evolve timetables with the (mu + lambda) evolutionary algorithm.
     The next generation is selected from a pool of previous population
@@ -711,20 +757,19 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, seed=None,
         Pipe for emigrants.
     sync : multiprocessing.Event
         Synchronization channel.
+    out_queue: multiprocessing.Queue
+        Queue for final hall of fame, population, and logbook output.
     seed : random seed
     verbose : bool
         Whether or not to log the statistics to stdout.
-
-    Returns
-    -------
-    TODO: output final generation to a Queue
     """
+    # TODO: output final generation to a Queue
 
-    NGEN = 500          # number of generations
-    MU = 50             # population size
+    NGEN = 20          # number of generations
+    MU = 100             # population size
     LAMBDA = MU         # number of offspring to generate each gen
-    CXPB = 0.75         # crossover probability
-    MUTPB = 0.25        # mutation probability
+    CXPB = 0.6         # crossover probability
+    MUTPB = 0.4        # mutation probability
     MIG_RATE = 5        # migration rate (generations)
     MIG_K = 5           # number of individuals migrated
     RR_THRESH = 50      # random restart if no improvement/stagnated
@@ -773,6 +818,7 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, seed=None,
             print(logbook.stream)
 
     previous_best = hof[0].fitness.values
+    last_improvement = 0
 
     # Begin the generational process
     for gen in range(1, NGEN + 1):
@@ -803,30 +849,41 @@ def mp_evolve(toolbox, procid, pipe_in, pipe_out, sync, seed=None,
             toolbox.migrate(deme)
 
         # random restart if best solution hasn't improved (stagnation)
-        if gen % RR_THRESH == 0:
-            if not hof[0].fitness.values < previous_best:
-                # save best of current population and generate a new one
-                elite = toolbox.select(deme, RR_KEEP)
-                new_pop = toolbox.population(n=MU-len(elite))
+        if not hof[0].fitness.values < previous_best:
+            last_improvement += 1
+        else:
+            last_improvement = 0
+            previous_best = hof[0].fitness.values
 
-                # evaluate fitnesses of new population
-                invalid_ind = [ind for ind in new_pop if not ind.fitness.valid]
-                fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
-                for ind, fit in zip(invalid_ind, fitnesses):
-                    ind.fitness.values = fit
+        if last_improvement >= RR_THRESH:
+            # reset
+            last_improvement = 0
+            print("restarting {}".format(procid))
 
-                if hof is not None:
-                    hof.update(new_pop)
+            # save best of current population and generate a new one
+            elite = toolbox.select(deme, RR_KEEP)
+            new_pop = toolbox.population(n=MU-len(elite))
 
-                # update population
-                deme[:] = new_pop + elite
-            else:
-                previous_best = hof[0].fitness.values
+            # evaluate fitnesses of new population
+            invalid_ind = [ind for ind in new_pop if not ind.fitness.valid]
+            fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+            for ind, fit in zip(invalid_ind, fitnesses):
+                ind.fitness.values = fit
 
-    print(hof[0].fitness.values)
+            if hof is not None:
+                hof.update(new_pop)
+
+            # update population
+            deme[:] = new_pop + elite
 
     # TODO return final population to an output Queue
     # return deme, logbook
+    result = {
+        'logbook': logbook,
+        'population': deme,
+        'halloffame': hof,
+    }
+    out_queue.put(result)
 
 
 if __name__ == '__main__':

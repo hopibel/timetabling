@@ -3,6 +3,7 @@
 import sys
 import pprint
 
+import os
 import argparse
 import random
 import sqlite3
@@ -196,6 +197,10 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
     Currently calculates:
     Number of overlapping classes
     Excess classes in a timeslot (overallocation/density)
+
+    To be compared in lexicographical order. First value is total penalties.
+    Second value is hard penalty, so in case of a tie the individual with lower
+    hard penalty is preferred.
     """
     overlap = 0
 
@@ -319,10 +324,13 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
                             overallocated -= unallocated
                             break
 
+    # total hard constraint fitness
+    hard_penalty = overlap + overallocated
+
     # soft constraint fitness (penalty. minimize)
     soft_penalty = soft_fitness(individual, sections)
 
-    return (overlap + overallocated, soft_penalty)
+    return (hard_penalty + soft_penalty, hard_penalty, soft_penalty)
 
 
 def soft_fitness(individual, sections):
@@ -555,7 +563,7 @@ def parse_args():
     parser.add_argument("-d", "--database",
                         help="sqlite3 database to use",
                         type=str, default='database.sqlite3')
-    parser.add_argument("-o", "--out", help="output file prefix for graphs and timetable",
+    parser.add_argument("-o", "--outdir", help="output directory name",
                         default="output")
     parser.add_argument("-v", "--verbose", help="log per-generation stats to console",
                         action='store_true')
@@ -646,7 +654,7 @@ def main():
 
     validate_faculty_load(faculty, sections)
 
-    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0))
+    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0, -1.0))
     creator.create("Individual", list, fitness=creator.Fitness)
 
     toolbox = base.Toolbox()
@@ -664,18 +672,16 @@ def main():
                      sections=sections,
                      rooms=rooms,
                      faculty=faculty)
-    toolbox.register('select', tools.selNSGA2, nd='log')
+    toolbox.register('select', tools.selTournament, tournsize=2)
 
     # number of processes to run in parallel
     NBR_DEMES = 4
 
+    # create output directory
+    os.makedirs(args.outdir)
+
     # perform multiple runs and average the results
-    run_hard = {
-        'min': [],
-        'avg': [],
-        'max': [],
-    }
-    run_soft = {
+    runs = {
         'min': [],
         'avg': [],
         'max': [],
@@ -713,8 +719,10 @@ def main():
 
         print("Collecting run {} statistics".format(run))
 
-        # need multiple graphs for multi-objective problem
-        gen = results[0]['logbook'].select('gen')
+        fit_min = []
+        fit_avg = []
+        fit_max = []
+
         hard_min = []
         hard_avg = []
         hard_max = []
@@ -724,15 +732,23 @@ def main():
         soft_max = []
         for r in results:
             log = r['logbook']
-            hard_min.append(numpy.array(log.select('min'))[:, 0])
-            hard_avg.append(numpy.array(log.select('avg'))[:, 0])
-            hard_max.append(numpy.array(log.select('max'))[:, 0])
+            fit_min.append(numpy.array(log.select('min'))[:, 0])
+            fit_avg.append(numpy.array(log.select('avg'))[:, 0])
+            fit_max.append(numpy.array(log.select('max'))[:, 0])
 
-            soft_min.append(numpy.array(log.select('min'))[:, 1])
-            soft_avg.append(numpy.array(log.select('avg'))[:, 1])
-            soft_max.append(numpy.array(log.select('max'))[:, 1])
+            hard_min.append(numpy.array(log.select('min'))[:, 1])
+            hard_avg.append(numpy.array(log.select('avg'))[:, 1])
+            hard_max.append(numpy.array(log.select('max'))[:, 1])
+
+            soft_min.append(numpy.array(log.select('min'))[:, 2])
+            soft_avg.append(numpy.array(log.select('avg'))[:, 2])
+            soft_max.append(numpy.array(log.select('max'))[:, 2])
 
         # combine results from each deme
+        fit_min = numpy.min(fit_min, axis=0)
+        fit_avg = numpy.mean(fit_avg, axis=0)
+        fit_max = numpy.max(fit_max, axis=0)
+
         hard_min = numpy.min(hard_min, axis=0)
         hard_avg = numpy.mean(hard_avg, axis=0)
         hard_max = numpy.max(hard_max, axis=0)
@@ -742,48 +758,55 @@ def main():
         soft_max = numpy.max(soft_max, axis=0)
 
         # save run results
-        run_hard['min'].append(hard_min)
-        run_hard['avg'].append(hard_avg)
-        run_hard['max'].append(hard_max)
-
-        run_soft['min'].append(soft_min)
-        run_soft['avg'].append(soft_avg)
-        run_soft['max'].append(soft_max)
+        runs['min'].append(numpy.column_stack((fit_min, hard_min, soft_min)))
+        runs['avg'].append(numpy.column_stack((fit_avg, hard_avg, soft_avg)))
+        runs['max'].append(numpy.column_stack((fit_max, hard_max, soft_max)))
 
         # checkpoint run results since this'll take a while
-        results = dict(run_hard=run_hard, run_soft=run_soft)
-        with open('run_results.pkl', 'wb') as cp_file:
-            pickle.dump(results, cp_file)
+        with open(os.path.join(args.outdir, 'run.pkl'), 'wb') as cp_file:
+            pickle.dump(runs, cp_file)
 
     # average results of all runs
-    hard_min = numpy.mean(numpy.array(run_hard['min']), axis=0)
-    hard_avg = numpy.mean(numpy.array(run_hard['avg']), axis=0)
-    hard_max = numpy.mean(numpy.array(run_hard['max']), axis=0)
+    for stat in runs.keys():
+        runs[stat] = numpy.mean(runs[stat], axis=0)
 
-    soft_min = numpy.mean(numpy.array(run_soft['min']), axis=0)
-    soft_avg = numpy.mean(numpy.array(run_soft['avg']), axis=0)
-    soft_max = numpy.mean(numpy.array(run_soft['max']), axis=0)
+    gen = results[0]['logbook'].select('gen')
 
     # plot final averaged results
-    fig, ax = plt.subplots(1, 2, figsize=plt.figaspect(0.4))
+    fig1, ax1 = plt.subplots()
+    fig2, ax2 = plt.subplots()
+    fig3, ax3 = plt.subplots()
 
-    ax[0].plot(gen, hard_min, 'g-', label='Minimum')
-    ax[0].plot(gen, hard_avg, 'b-', label='Average')
-    ax[0].plot(gen, hard_max, 'r-', label='Maximum')
-    ax[0].set_title('Hard constraints')
+    ax1.plot(gen, numpy.array(runs['min'])[:, 0], 'g-', label='Minimum')
+    ax1.plot(gen, numpy.array(runs['avg'])[:, 0], 'b-', label='Average')
+    ax1.plot(gen, numpy.array(runs['max'])[:, 0], 'r-', label='Maximum')
+    ax1.set_title('Hard + Soft')
+    ax1.set_xlabel('Generation')
+    ax1.set_ylabel('Fitness')
+    ax1.set_ylim(ymin=0)
+    ax1.legend()
 
-    ax[1].plot(gen, soft_min, 'g-', label='Minimum')
-    ax[1].plot(gen, soft_avg, 'b-', label='Average')
-    ax[1].plot(gen, soft_max, 'r-', label='Maximum')
-    ax[1].set_title('Soft constraints')
+    ax2.plot(gen, numpy.array(runs['min'])[:, 1], 'g-', label='Minimum')
+    ax2.plot(gen, numpy.array(runs['avg'])[:, 1], 'b-', label='Average')
+    ax2.plot(gen, numpy.array(runs['max'])[:, 1], 'r-', label='Maximum')
+    ax2.set_title('Hard')
+    ax2.set_xlabel('Generation')
+    ax2.set_ylabel('Fitness')
+    ax2.set_ylim(ymin=0)
+    ax2.legend()
 
-    for axis in ax:
-        axis.set_xlabel('Generation')
-        axis.set_ylabel('Fitness')
-        axis.set_ylim(ymin=0)
-        axis.legend()
+    ax3.plot(gen, numpy.array(runs['min'])[:, 2], 'g-', label='Minimum')
+    ax3.plot(gen, numpy.array(runs['avg'])[:, 2], 'b-', label='Average')
+    ax3.plot(gen, numpy.array(runs['max'])[:, 2], 'r-', label='Maximum')
+    ax3.set_title('Soft')
+    ax3.set_xlabel('Generation')
+    ax3.set_ylabel('Fitness')
+    ax3.set_ylim(ymin=0)
+    ax3.legend()
 
-    plt.savefig('{}.png'.format(args.out))
+    fig1.savefig(os.path.join(args.outdir, '{}-both.png'.format(args.outdir)))
+    fig2.savefig(os.path.join(args.outdir, '{}-hard.png'.format(args.outdir)))
+    fig3.savefig(os.path.join(args.outdir, '{}-soft.png'.format(args.outdir)))
 
     # # TODO: save state before exiting
     # # TODO: replace with matplotlib graph and sqlite export
@@ -820,11 +843,11 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
     NGEN = ngen         # number of generations
     MU = len(pop)       # population size
     LAMBDA = MU         # number of offspring to generate each gen
-    CXPB = 0.7          # crossover probability
+    CXPB = 0.6          # crossover probability
     MUTPB = 0.3         # mutation probability
     MIG_RATE = 5        # migration rate (generations)
     MIG_K = 5           # number of individuals migrated
-    RR_THRESH = 50      # random restart if no improvement/stagnated
+    RR_THRESH = 20      # random restart if no improvement/stagnated
     RR_KEEP = 5         # keep the best individuals during a restart
     CHKPOINT = 50       # checkpoint frequency
     LOG_RATE = 25       # hall of fame log frequency
@@ -832,11 +855,11 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
     # start each deme with a different seed
     random.seed(seed)
     toolbox.register("migrate", mig_pipe, k=MIG_K, pipe_in=pipe_in,
-                     pipe_out=pipe_out, selection=tools.selNSGA2,
+                     pipe_out=pipe_out, selection=tools.selBest,
                      replacement=random.sample)
 
     deme = pop
-    hof = tools.HallOfFame(maxsize=1)
+    hof = tools.HallOfFame(maxsize=MU)
     stats = tools.Statistics(lambda ind: ind.fitness.values)
     stats.register("avg", numpy.mean, axis=0)
     stats.register("std", numpy.std, axis=0)
@@ -870,13 +893,13 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
             sync.wait()
             print(logbook.stream)
 
-    previous_best = hof[0].fitness.values
-    last_improvement = 0
-
     # Begin the generational process
     for gen in range(1, NGEN + 1):
+        # Select the next generation population
+        offspring = toolbox.select(deme, len(deme))
+
         # Vary the population
-        offspring = algorithms.varOr(deme, toolbox, LAMBDA, CXPB, MUTPB)
+        offspring = algorithms.varAnd(offspring, toolbox, CXPB, MUTPB)
 
         # Evaluate the individuals with an invalid fitness
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
@@ -888,11 +911,10 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
         if hof is not None:
             hof.update(offspring)
 
-        # Select the next generation population
-        deme[:] = toolbox.select(deme + offspring, MU)
+        deme[:] = offspring
 
         # Update the statistics with the new population
-        record = stats.compile(deme) if stats is not None else {}
+        record = stats.compile(deme) if stats else {}
         logbook.record(gen=gen, deme=procid, nevals=len(invalid_ind), **record)
         if verbose:
             print(logbook.stream)
@@ -902,32 +924,28 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
             toolbox.migrate(deme)
 
         # random restart if best solution hasn't improved (stagnation)
-        if not hof[0].fitness.values < previous_best:
-            last_improvement += 1
-        else:
-            last_improvement = 0
-            previous_best = hof[0].fitness.values
+        if gen % RR_THRESH == 0:
+            current_avg = tuple(logbook[-1]['avg'])
+            old_avg = tuple(logbook[-RR_THRESH]['avg'])
 
-        if last_improvement >= RR_THRESH:
-            # reset
-            last_improvement = 0
-            print("restarting {}".format(procid))
+            if not current_avg < old_avg:
+                print("restarting {}".format(procid))
 
-            # save best of current population and generate a new one
-            elite = toolbox.select(deme, RR_KEEP)
-            new_pop = toolbox.population(n=MU-len(elite))
+                # save some of current population and generate a new one
+                elite = tools.selBest(deme, RR_KEEP)
+                new_pop = toolbox.population(n=MU-len(elite))
 
-            # evaluate fitnesses of new population
-            invalid_ind = [ind for ind in new_pop if not ind.fitness.valid]
-            fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
-            for ind, fit in zip(invalid_ind, fitnesses):
-                ind.fitness.values = fit
+                # evaluate fitnesses of new population
+                invalid_ind = [ind for ind in new_pop if not ind.fitness.valid]
+                fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+                for ind, fit in zip(invalid_ind, fitnesses):
+                    ind.fitness.values = fit
 
-            if hof is not None:
-                hof.update(new_pop)
+                if hof is not None:
+                    hof.update(new_pop)
 
-            # update population
-            deme[:] = new_pop + elite
+                # update population
+                deme[:] = new_pop + elite
 
         # log current hall of fame individual regularly
         if gen % LOG_RATE == 0:
@@ -943,3 +961,6 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
 
 if __name__ == '__main__':
     main()
+
+    # possible improvements:
+    # focus mutation on genes/sections involved in conflicts

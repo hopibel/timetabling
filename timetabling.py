@@ -2,8 +2,8 @@
 
 import sys
 import pprint
-
 import os
+import signal
 import argparse
 import random
 import sqlite3
@@ -558,7 +558,7 @@ def parse_args():
     parser.add_argument("gens", help="number of generations", type=int)
     parser.add_argument("-r", "--runs", help="average results over multiple runs",
                         type=int, default=1)
-    parser.add_argument("-c", "--continue", help="result from last checkpoint",
+    parser.add_argument("-c", "--resume", help="result from last checkpoint",
                         action='store_true')
     parser.add_argument("-d", "--database",
                         help="sqlite3 database to use",
@@ -575,6 +575,12 @@ def main():
     """Entry point if called as executable."""
 
     args = parse_args()
+
+    # suppress errors when not in debug mode
+    def exit_msg():
+        print("Received ctrl-c")
+        sys.exit()
+    signal.signal(signal.SIGINT, lambda signal_number, stack_frame: exit_msg())
 
     # set up database connection
     conn = sqlite3.connect(args.database)
@@ -677,16 +683,36 @@ def main():
     # number of processes to run in parallel
     NBR_DEMES = 4
 
-    # create output directory
-    os.makedirs(args.outdir)
+    # create output directory if it doesn't exist
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # perform multiple runs and average the results
+    start_run = 1
     runs = {
         'min': [],
         'avg': [],
         'max': [],
     }
-    for run in range(1, args.runs+1):
+
+    # resume previous run if applicable
+    checkpoint = os.path.join(args.outdir, 'runs_cp.pkl')
+    if args.resume:
+        try:
+            with open(checkpoint, 'rb') as cp_file:
+                cp = pickle.load(cp_file)
+                start_run = cp['start_run']
+                runs = cp['runs']
+        except FileNotFoundError:
+            print("No checkpoint found. Starting a new run")
+
+    with open(checkpoint, 'wb') as cp_file:
+        cp = dict(
+            start_run=start_run,
+            runs=runs
+        )
+        pickle.dump(cp, cp_file)
+
+    # perform multiple runs and average the results
+    for run in range(start_run, args.runs+1):
         print("Started run {}/{}".format(run, args.runs))
 
         # set up migration pipes in ring topology
@@ -701,11 +727,13 @@ def main():
 
         processes = [
             Process(target=mp_evolve,
-                    args=(toolbox.population(args.pop), args.gens, toolbox,
-                          i, ipipe, opipe, e, out_queue, random.random(), args.verbose))
+                    args=(args, toolbox, i, ipipe, opipe, e, out_queue,
+                          random.random(), args.verbose))
             for i, (ipipe, opipe)
             in enumerate(zip(pipes_in, pipes_out))
         ]
+        # prevent succeeding runs from trying to resume with old checkpoint
+        args.resume = False
 
         for proc in processes:
             proc.start()
@@ -763,8 +791,12 @@ def main():
         runs['max'].append(numpy.column_stack((fit_max, hard_max, soft_max)))
 
         # checkpoint run results since this'll take a while
-        with open(os.path.join(args.outdir, 'run.pkl'), 'wb') as cp_file:
-            pickle.dump(runs, cp_file)
+        with open(os.path.join(args.outdir, 'runs_cp.pkl'), 'wb') as cp_file:
+            cp = dict(
+                start_run=run,
+                runs=runs
+            )
+            pickle.dump(cp, cp_file)
 
     # average results of all runs
     for stat in runs.keys():
@@ -804,16 +836,16 @@ def main():
     ax3.set_ylim(ymin=0)
     ax3.legend()
 
-    fig1.savefig(os.path.join(args.outdir, '{}-both.png'.format(args.outdir)))
-    fig2.savefig(os.path.join(args.outdir, '{}-hard.png'.format(args.outdir)))
-    fig3.savefig(os.path.join(args.outdir, '{}-soft.png'.format(args.outdir)))
+    fig1.savefig(os.path.join(args.outdir, 'fitness_both.png'))
+    fig2.savefig(os.path.join(args.outdir, 'fitness_hard.png'))
+    fig3.savefig(os.path.join(args.outdir, 'fitness_soft.png'))
 
     # # TODO: save state before exiting
     # # TODO: replace with matplotlib graph and sqlite export
     # to_html.to_html(solution, sections, SLOTS, DAY_SLOTS)
 
 
-def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
+def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
               verbose=__debug__):
     """Evolve timetables with the (mu + lambda) evolutionary algorithm.
     The next generation is selected from a pool of previous population
@@ -840,8 +872,8 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
         Whether or not to log the statistics to stdout.
     """
 
-    NGEN = ngen         # number of generations
-    MU = len(pop)       # population size
+    NGEN = args.gens    # number of generations
+    MU = args.pop       # population size
     LAMBDA = MU         # number of offspring to generate each gen
     CXPB = 0.6          # crossover probability
     MUTPB = 0.3         # mutation probability
@@ -849,28 +881,50 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
     MIG_K = 5           # number of individuals migrated
     RR_THRESH = 20      # random restart if no improvement/stagnated
     RR_KEEP = 5         # keep the best individuals during a restart
-    CHKPOINT = 50       # checkpoint frequency
+    CHKPOINT = 10       # checkpoint frequency
     LOG_RATE = 25       # hall of fame log frequency
 
-    # start each deme with a different seed
-    random.seed(seed)
+    checkpoint = os.path.join(args.outdir, 'deme{}_cp.pkl'.format(procid))
+    if args.resume:
+        # resume with checkpoint in resume_prefix folder
+        with open(checkpoint, 'rb') as cp_file:
+            cp = pickle.load(cp_file)
+        deme = cp['population']
+        start_gen = cp['generation']
+        hof = cp['halloffame']
+        logbook = cp['logbook']
+        random.setstate(cp['rngstate'])
+    else:
+        # start a new evolution
+        # start each deme with a different seed
+        deme = toolbox.population(MU)
+        start_gen = 1
+        random.seed(seed)
+        hof = tools.HallOfFame(maxsize=MU)
+        logbook = tools.Logbook()
+        logbook.header = ('gen', 'deme', 'nevals', 'std', 'min', 'avg', 'max')
+
+        # initial checkpoint
+        cp = dict(
+            population=deme,
+            generation=start_gen,
+            halloffame=hof,
+            logbook=logbook,
+            rngstate=random.getstate()
+        )
+        with open(checkpoint, 'wb') as cp_file:
+            pickle.dump(cp, cp_file)
+
+    # set up migration pipes
     toolbox.register("migrate", mig_pipe, k=MIG_K, pipe_in=pipe_in,
                      pipe_out=pipe_out, selection=tools.selBest,
                      replacement=random.sample)
 
-    deme = pop
-    hof = tools.HallOfFame(maxsize=MU)
     stats = tools.Statistics(lambda ind: ind.fitness.values)
     stats.register("avg", numpy.mean, axis=0)
     stats.register("std", numpy.std, axis=0)
     stats.register("min", numpy.min, axis=0)
     stats.register("max", numpy.max, axis=0)
-
-    # TODO: pickle and checkpoint regularly
-    # TODO: save logbooks until we have matplotlib output
-    # TODO: argparse optional --continue
-    logbook = tools.Logbook()
-    logbook.header = ('gen', 'deme', 'nevals', 'std', 'min', 'avg', 'max')
 
     # Evaluate the individuals with an invalid fitness
     invalid_ind = [ind for ind in deme if not ind.fitness.valid]
@@ -879,7 +933,7 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
         ind.fitness.values = fit
 
     record = stats.compile(deme) if stats is not None else {}
-    logbook.record(gen=0, deme=procid, nevals=len(invalid_ind), **record)
+    logbook.record(gen=start_gen, deme=procid, nevals=len(invalid_ind), **record)
     if hof is not None:
         hof.update(deme)
 
@@ -894,7 +948,7 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
             print(logbook.stream)
 
     # Begin the generational process
-    for gen in range(1, NGEN + 1):
+    for gen in range(start_gen + 1, NGEN + 1):
         # Select the next generation population
         offspring = toolbox.select(deme, len(deme))
 
@@ -950,6 +1004,18 @@ def mp_evolve(pop, ngen, toolbox, procid, pipe_in, pipe_out, sync, out_queue, se
         # log current hall of fame individual regularly
         if gen % LOG_RATE == 0:
             print("Deme {} best: {}".format(procid, hof[0].fitness.values))
+
+        # checkpoint
+        if gen % CHKPOINT == 0:
+            cp = dict(
+                population=deme,
+                generation=gen,
+                halloffame=hof,
+                logbook=logbook,
+                rngstate=random.getstate()
+            )
+            with open(checkpoint, 'wb') as cp_file:
+                pickle.dump(cp, cp_file)
 
     result = {
         'logbook': logbook,

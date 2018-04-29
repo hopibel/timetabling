@@ -879,6 +879,7 @@ def main():
 
     # get best solution, minimizing hard penalty first
     best = min(halloffame, key=lambda ind: tuple(ind.fitness.values[1:]))
+    print("Fittest timetable found: {}".format(toolbox.evaluate(best)))
 
     # export best solution to an sqlite3 db
     conn = sqlite3.connect(os.path.join(args.outdir, 'final_timetable.sqlite3'))

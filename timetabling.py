@@ -515,6 +515,60 @@ def day_time_to_slot(day, time):
     return slot
 
 
+def slot_to_day_time(slot):
+    """
+    Calculate day and time based on time slot.
+    """
+    day = slot // DAY_SLOTS
+    hour = slot % DAY_SLOTS
+    time = DAY_START_TIME
+    time += hour // 2 * 100
+    time += hour % 2 * 30
+    return day, time
+
+
+def plot_results(gen, runs, outdir):
+    # average results of all runs
+    for stat in runs.keys():
+        runs[stat] = numpy.mean(runs[stat], axis=0)
+
+    # plot final averaged results
+    fig1, ax1 = plt.subplots()
+    fig2, ax2 = plt.subplots()
+    fig3, ax3 = plt.subplots()
+
+    ax1.plot(gen, numpy.array(runs['min'])[:, 0], 'g-', label='Minimum')
+    ax1.plot(gen, numpy.array(runs['avg'])[:, 0], 'b-', label='Average')
+    ax1.plot(gen, numpy.array(runs['max'])[:, 0], 'r-', label='Maximum')
+    ax1.set_title('Hard + Soft constraints')
+    ax1.set_xlabel('Generation')
+    ax1.set_ylabel('Fitness')
+    ax1.set_ylim(ymin=0)
+    ax1.legend()
+
+    ax2.plot(gen, numpy.array(runs['min'])[:, 1], 'g-', label='Minimum')
+    ax2.plot(gen, numpy.array(runs['avg'])[:, 1], 'b-', label='Average')
+    ax2.plot(gen, numpy.array(runs['max'])[:, 1], 'r-', label='Maximum')
+    ax2.set_title('Hard constraints')
+    ax2.set_xlabel('Generation')
+    ax2.set_ylabel('Fitness')
+    ax2.set_ylim(ymin=0)
+    ax2.legend()
+
+    ax3.plot(gen, numpy.array(runs['min'])[:, 2], 'g-', label='Minimum')
+    ax3.plot(gen, numpy.array(runs['avg'])[:, 2], 'b-', label='Average')
+    ax3.plot(gen, numpy.array(runs['max'])[:, 2], 'r-', label='Maximum')
+    ax3.set_title('Soft constraints')
+    ax3.set_xlabel('Generation')
+    ax3.set_ylabel('Fitness')
+    ax3.set_ylim(ymin=0)
+    ax3.legend()
+
+    fig1.savefig(os.path.join(outdir, 'fitness_both.png'), dpi=600)
+    fig2.savefig(os.path.join(outdir, 'fitness_hard.png'), dpi=600)
+    fig3.savefig(os.path.join(outdir, 'fitness_soft.png'), dpi=600)
+
+
 def mig_pipe(deme, k, pipe_in, pipe_out, selection, replacement=None):
     """Migration using pipes between processes. It first selects
     *k* individuals from the *deme* and writes them in *pipe_out*. Then it
@@ -692,6 +746,7 @@ def main():
         'avg': [],
         'max': [],
     }
+    halloffame = []
 
     # resume previous run if applicable
     checkpoint = os.path.join(args.outdir, 'runs_cp.pkl')
@@ -701,13 +756,27 @@ def main():
                 cp = pickle.load(cp_file)
                 start_run = cp['start_run']
                 runs = cp['runs']
+                halloffame = cp['halloffame']
+                gens = cp['gens']
+
+            # discard results if number of generations changed
+            # can't collect stats on different length runs
+            if args.gens != gens:
+                runs = {
+                    'min': [],
+                    'avg': [],
+                    'max': [],
+                }
         except FileNotFoundError:
             print("No checkpoint found. Starting a new run")
+            args.resume = False
 
     with open(checkpoint, 'wb') as cp_file:
         cp = dict(
             start_run=start_run,
-            runs=runs
+            runs=runs,
+            halloffame=halloffame,
+            gens=args.gens
         )
         pickle.dump(cp, cp_file)
 
@@ -732,11 +801,12 @@ def main():
             for i, (ipipe, opipe)
             in enumerate(zip(pipes_in, pipes_out))
         ]
-        # prevent succeeding runs from trying to resume with old checkpoint
-        args.resume = False
 
         for proc in processes:
             proc.start()
+
+        # prevent succeeding runs from trying to resume with old checkpoint
+        args.resume = False
 
         results = []
         for i in range(NBR_DEMES):
@@ -772,6 +842,9 @@ def main():
             soft_avg.append(numpy.array(log.select('avg'))[:, 2])
             soft_max.append(numpy.array(log.select('max'))[:, 2])
 
+            # collect hall of fame members
+            halloffame.extend(r['halloffame'])
+
         # combine results from each deme
         fit_min = numpy.min(fit_min, axis=0)
         fit_avg = numpy.mean(fit_avg, axis=0)
@@ -794,55 +867,65 @@ def main():
         with open(os.path.join(args.outdir, 'runs_cp.pkl'), 'wb') as cp_file:
             cp = dict(
                 start_run=run,
-                runs=runs
+                runs=runs,
+                halloffame=halloffame,
+                gens=args.gens
             )
             pickle.dump(cp, cp_file)
 
-    # average results of all runs
-    for stat in runs.keys():
-        runs[stat] = numpy.mean(runs[stat], axis=0)
-
+    # average and plot results
     gen = results[0]['logbook'].select('gen')
+    plot_results(gen, runs, args.outdir)
 
-    # plot final averaged results
-    fig1, ax1 = plt.subplots()
-    fig2, ax2 = plt.subplots()
-    fig3, ax3 = plt.subplots()
+    # get best solution, minimizing hard penalty first
+    best = min(halloffame, key=lambda ind: tuple(ind.fitness.values[1:]))
 
-    ax1.plot(gen, numpy.array(runs['min'])[:, 0], 'g-', label='Minimum')
-    ax1.plot(gen, numpy.array(runs['avg'])[:, 0], 'b-', label='Average')
-    ax1.plot(gen, numpy.array(runs['max'])[:, 0], 'r-', label='Maximum')
-    ax1.set_title('Hard + Soft')
-    ax1.set_xlabel('Generation')
-    ax1.set_ylabel('Fitness')
-    ax1.set_ylim(ymin=0)
-    ax1.legend()
+    # export best solution to an sqlite3 db
+    conn = sqlite3.connect(os.path.join(args.outdir, 'final_timetable.sqlite3'))
+    c = conn.cursor()
+    c.execute("""
+    DROP TABLE IF EXISTS timetable
+    """)
+    c.execute("""
+    CREATE TABLE timetable(
+        instructor text NOT NULL,
+        course text NOT NULL,
+        section text NOT NULL,
+        schedule text NOT NULL,
+        start int NOT NULL,
+        end int NOT NULL,
+        room text NOT NULL
+    )""")
 
-    ax2.plot(gen, numpy.array(runs['min'])[:, 1], 'g-', label='Minimum')
-    ax2.plot(gen, numpy.array(runs['avg'])[:, 1], 'b-', label='Average')
-    ax2.plot(gen, numpy.array(runs['max'])[:, 1], 'r-', label='Maximum')
-    ax2.set_title('Hard')
-    ax2.set_xlabel('Generation')
-    ax2.set_ylabel('Fitness')
-    ax2.set_ylim(ymin=0)
-    ax2.legend()
+    # add each section to the database
+    rows = []
+    for section in best:
+        section_data = sections[section.section_id]
 
-    ax3.plot(gen, numpy.array(runs['min'])[:, 2], 'g-', label='Minimum')
-    ax3.plot(gen, numpy.array(runs['avg'])[:, 2], 'b-', label='Average')
-    ax3.plot(gen, numpy.array(runs['max'])[:, 2], 'r-', label='Maximum')
-    ax3.set_title('Soft')
-    ax3.set_xlabel('Generation')
-    ax3.set_ylabel('Fitness')
-    ax3.set_ylim(ymin=0)
-    ax3.legend()
+        # convert slot to days and times
+        day, start = slot_to_day_time(section.slot)
+        length = section_data.length
+        _, end = slot_to_day_time(section.slot + length)
+        if section.is_twice_weekly:
+            schedule = ('MTh', 'TF')[day]
+        else:
+            schedule = ('M', 'T', 'W', 'Th', 'F')[day]
 
-    fig1.savefig(os.path.join(args.outdir, 'fitness_both.png'))
-    fig2.savefig(os.path.join(args.outdir, 'fitness_hard.png'))
-    fig3.savefig(os.path.join(args.outdir, 'fitness_soft.png'))
+        row = (
+            section_data.instructor.name,
+            section_data.course.name,
+            section_data.id_,
+            schedule,
+            start,
+            end,
+            rooms[section.room].name,
+        )
+        rows.append(row)
+    c.executemany(
+        'INSERT OR REPLACE INTO timetable VALUES (?, ?, ?, ?, ?, ?, ?)', rows)
 
-    # # TODO: save state before exiting
-    # # TODO: replace with matplotlib graph and sqlite export
-    # to_html.to_html(solution, sections, SLOTS, DAY_SLOTS)
+    conn.commit()
+    conn.close()
 
 
 def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
@@ -884,6 +967,17 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
     CHKPOINT = 10       # checkpoint frequency
     LOG_RATE = 25       # hall of fame log frequency
 
+    # set up migration pipes
+    toolbox.register("migrate", mig_pipe, k=MIG_K, pipe_in=pipe_in,
+                     pipe_out=pipe_out, selection=tools.selBest,
+                     replacement=random.sample)
+
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", numpy.mean, axis=0)
+    stats.register("std", numpy.std, axis=0)
+    stats.register("min", numpy.min, axis=0)
+    stats.register("max", numpy.max, axis=0)
+
     checkpoint = os.path.join(args.outdir, 'deme{}_cp.pkl'.format(procid))
     if args.resume:
         # resume with checkpoint in resume_prefix folder
@@ -896,7 +990,6 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
         random.setstate(cp['rngstate'])
     else:
         # start a new evolution
-        # start each deme with a different seed
         deme = toolbox.population(MU)
         start_gen = 1
         random.seed(seed)
@@ -915,37 +1008,26 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
         with open(checkpoint, 'wb') as cp_file:
             pickle.dump(cp, cp_file)
 
-    # set up migration pipes
-    toolbox.register("migrate", mig_pipe, k=MIG_K, pipe_in=pipe_in,
-                     pipe_out=pipe_out, selection=tools.selBest,
-                     replacement=random.sample)
+        # Evaluate the individuals with an invalid fitness
+        invalid_ind = [ind for ind in deme if not ind.fitness.valid]
+        fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+        for ind, fit in zip(invalid_ind, fitnesses):
+            ind.fitness.values = fit
 
-    stats = tools.Statistics(lambda ind: ind.fitness.values)
-    stats.register("avg", numpy.mean, axis=0)
-    stats.register("std", numpy.std, axis=0)
-    stats.register("min", numpy.min, axis=0)
-    stats.register("max", numpy.max, axis=0)
+        record = stats.compile(deme) if stats is not None else {}
+        logbook.record(gen=start_gen, deme=procid, nevals=len(invalid_ind), **record)
+        if hof is not None:
+            hof.update(deme)
 
-    # Evaluate the individuals with an invalid fitness
-    invalid_ind = [ind for ind in deme if not ind.fitness.valid]
-    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
-    for ind, fit in zip(invalid_ind, fitnesses):
-        ind.fitness.values = fit
-
-    record = stats.compile(deme) if stats is not None else {}
-    logbook.record(gen=start_gen, deme=procid, nevals=len(invalid_ind), **record)
-    if hof is not None:
-        hof.update(deme)
-
-    if verbose:
-        if procid == 0:
-            # Synchronization needed to log header on top exactly once
-            print(logbook.stream)
-            sync.set()
-        else:
-            logbook.log_header = False  # never output the header
-            sync.wait()
-            print(logbook.stream)
+        if verbose:
+            if procid == 0:
+                # Synchronization needed to log header on top exactly once
+                print(logbook.stream)
+                sync.set()
+            else:
+                logbook.log_header = False  # never output the header
+                sync.wait()
+                print(logbook.stream)
 
     # Begin the generational process
     for gen in range(start_gen + 1, NGEN + 1):
@@ -1006,7 +1088,7 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
             print("Deme {} best: {}".format(procid, hof[0].fitness.values))
 
         # checkpoint
-        if gen % CHKPOINT == 0:
+        if gen % CHKPOINT == 0 or gen == NGEN:
             cp = dict(
                 population=deme,
                 generation=gen,

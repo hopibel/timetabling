@@ -1,10 +1,10 @@
 """Timetabling using a genetic algorithm"""
 
 import sys
-import pprint
 import os
 import signal
 import argparse
+import math
 import random
 import sqlite3
 import pickle
@@ -21,8 +21,8 @@ from deap import tools
 
 import to_html
 
-DAY_START_TIME = 0
-DAY_SLOTS = 48
+DAY_START_TIME = 600
+DAY_SLOTS = 28
 SLOTS = DAY_SLOTS * 5
 
 Room = namedtuple('Room', ['name', 'capacity', 'category'])
@@ -229,7 +229,7 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
 
                 # overlap = min required width - actual width
                 width = (max(a.slot + a_section.length,
-                            b.slot + b_section.length)
+                             b.slot + b_section.length)
                          - min(a.slot, b.slot))
                 overlap += a_section.length + b_section.length - width
 
@@ -330,7 +330,14 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
     # soft constraint fitness (penalty. minimize)
     soft_penalty = soft_fitness(individual, sections)
 
-    return (hard_penalty + soft_penalty, hard_penalty, soft_penalty)
+    # sum of penalties or zero if hard_penalty == 0
+    if hard_penalty == 0:
+        combined_penalty = 0
+    else:
+        combined_penalty = hard_penalty + soft_penalty
+
+    return (hard_penalty, soft_penalty)
+    #return (combined_penalty, hard_penalty, soft_penalty)
 
 
 def soft_fitness(individual, sections):
@@ -374,9 +381,10 @@ def soft_fitness(individual, sections):
             # ignore gap if it is from the instructor's availability schedule
             if a.slot // DAY_SLOTS == b.slot // DAY_SLOTS:
                 gap = range(a.slot + a_data.length, b.slot)
+                instructor_avail_gap = len(instructor.gaps.intersection(gap))
 
-                gap_length += len(gap)
-                gap_length -= len(instructor.gaps.intersection(gap))
+                old_gap = gap_length
+                gap_length += len(gap) - instructor_avail_gap
 
                 # count_consecutive
                 if a.slot + a_data.length == b.slot:
@@ -384,7 +392,11 @@ def soft_fitness(individual, sections):
                     if consecutive > instructor.max_consecutive:
                         consecutive_penalty += 1
                 else:
+                    # if gap prevents consecutive_penalty, reduce gap penalty
+                    if consecutive == instructor.max_consecutive and len(gap) > instructor_avail_gap:
+                        gap_length -= 1
                     consecutive = 1
+                assert gap_length - old_gap >= 0
             else:
                 # reset consecutive count between days
                 consecutive = 1
@@ -535,12 +547,11 @@ def plot_results(gen, runs, outdir):
     # plot final averaged results
     fig1, ax1 = plt.subplots()
     fig2, ax2 = plt.subplots()
-    fig3, ax3 = plt.subplots()
 
     ax1.plot(gen, numpy.array(runs['min'])[:, 0], 'g-', label='Minimum')
     ax1.plot(gen, numpy.array(runs['avg'])[:, 0], 'b-', label='Average')
     ax1.plot(gen, numpy.array(runs['max'])[:, 0], 'r-', label='Maximum')
-    ax1.set_title('Hard + Soft constraints')
+    ax1.set_title('Hard constraints')
     ax1.set_xlabel('Generation')
     ax1.set_ylabel('Fitness')
     ax1.set_ylim(ymin=0)
@@ -549,24 +560,182 @@ def plot_results(gen, runs, outdir):
     ax2.plot(gen, numpy.array(runs['min'])[:, 1], 'g-', label='Minimum')
     ax2.plot(gen, numpy.array(runs['avg'])[:, 1], 'b-', label='Average')
     ax2.plot(gen, numpy.array(runs['max'])[:, 1], 'r-', label='Maximum')
-    ax2.set_title('Hard constraints')
+    ax2.set_title('Soft constraints')
     ax2.set_xlabel('Generation')
     ax2.set_ylabel('Fitness')
     ax2.set_ylim(ymin=0)
     ax2.legend()
 
-    ax3.plot(gen, numpy.array(runs['min'])[:, 2], 'g-', label='Minimum')
-    ax3.plot(gen, numpy.array(runs['avg'])[:, 2], 'b-', label='Average')
-    ax3.plot(gen, numpy.array(runs['max'])[:, 2], 'r-', label='Maximum')
-    ax3.set_title('Soft constraints')
-    ax3.set_xlabel('Generation')
-    ax3.set_ylabel('Fitness')
-    ax3.set_ylim(ymin=0)
-    ax3.legend()
+    fig1.savefig(os.path.join(outdir, 'fitness_hard.png'), dpi=600)
+    fig2.savefig(os.path.join(outdir, 'fitness_soft.png'), dpi=600)
 
-    fig1.savefig(os.path.join(outdir, 'fitness_both.png'), dpi=600)
-    fig2.savefig(os.path.join(outdir, 'fitness_hard.png'), dpi=600)
-    fig3.savefig(os.path.join(outdir, 'fitness_soft.png'), dpi=600)
+
+def export_to_image(best, sections, rooms, outdir):
+    """
+    Save schedules in tabular form to outdir
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    # group by instructor and room
+    by_instructor = {}
+    by_room = {}
+    for section in best:
+        prof = sections[section.section_id].instructor
+        if prof not in by_instructor:
+            by_instructor[prof] = []
+        by_instructor[prof].append(section)
+
+        if section.room not in by_room:
+            by_room[section.room] = []
+        by_room[section.room].append(section)
+
+    day_start = DAY_START_TIME
+    day_end = day_start + DAY_SLOTS // 2 * 100 + (DAY_SLOTS % 2) * 30
+    days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+
+    # generate instructor schedules
+    # based on http://masudakoji.github.io/2015/05/23/generate-timetable-using-matplotlib/en/
+    for prof in by_instructor.keys():
+        fig, ax = plt.subplots(figsize=(12, 12))
+        for section in by_instructor[prof]:
+            section_data = sections[section.section_id]
+            day, time = slot_to_day_time(section.slot)
+            day += 1  # 1-based indexing
+            day -= 0.5
+            hour = time // 100
+            minute = time % 100
+            start = hour * 100 + minute / 60 * 100
+            _, end = slot_to_day_time(section.slot + section_data.length)
+            end = end // 100 * 100 + (end % 100) / 60 * 100
+
+            # plot classes
+            ax.fill_between(
+                [day, day+1], [start, start], [end, end],
+                facecolor='lightgreen', edgecolor='k', linewidth=2, alpha=0.7)
+            # show time in top left corner
+            ax.text(day+0.05, start+10, '{0}:{1:0>2}'.format(hour, minute),
+                    va='top', fontsize=8)
+            # show class and room name
+            text = "{}\n{}".format(section_data.course.name, rooms[section.room].name)
+            ax.text(day+0.5, (start+end)*0.5, text,
+                    ha='center', va='center', fontsize=11)
+
+            if section.is_twice_weekly:
+                day += 3
+                # plot classes
+                ax.fill_between(
+                    [day, day+1], [start, start], [end, end],
+                    facecolor='lightgreen', edgecolor='k', linewidth=2, alpha=0.7)
+                # show time in top left corner
+                ax.text(day+0.05, start+10, '{0}:{1:0>2}'.format(hour, minute),
+                        va='top', fontsize=8)
+                # show class and room name
+                text = "{}\n{}".format(section_data.course.name, rooms[section.room].name)
+                ax.text(day+0.5, (start+end)*0.5, text,
+                        ha='center', va='center', fontsize=11)
+
+        # offset title to avoid getting covered by day labels
+        ax.set_title('Instructor: {}'.format(prof.name), y=1.07)
+
+        ax.yaxis.grid()
+        ax.set_xlim(0.5, 5.5)
+        ax.set_ylim(day_end, day_start)
+        ax.set_xticks(range(1, 6))
+        ax.set_xticklabels(days)
+        ax.set_ylabel('Time')
+        ax.set_yticks(range(day_start, day_end, 50))
+        time_labels = []
+        for time in range(day_start, day_end, 100):
+            hour = time // 100
+            time_labels.append('{0}:{1:0>2}'.format(hour, 0))
+            time_labels.append('{0}:{1:0>2}'.format(hour, 30))
+        ax.set_yticklabels(time_labels)
+
+        # show labels on both sides
+        ax2 = ax.twiny().twinx()
+        ax2.set_xlim(ax.get_xlim())
+        ax2.set_ylim(ax.get_ylim())
+        ax2.set_xticks(ax.get_xticks())
+        ax2.set_xticklabels(days)
+        ax2.set_yticks(ax.get_yticks())
+        ax2.set_yticklabels(time_labels)
+
+        filename = os.path.join(outdir, 'prof_{}.png'.format(prof.name.replace(' ', '_')))
+        print("Writing {}".format(filename))
+        fig.savefig(filename)
+        plt.close(fig)
+
+    # generate room schedules
+    for room_id in by_room:
+        room = rooms[room_id]
+        fig, ax = plt.subplots(figsize=(12, 12))
+        for section in by_room[room_id]:
+            section_data = sections[section.section_id]
+            day, time = slot_to_day_time(section.slot)
+            day += 1  # 1-based indexing
+            day -= 0.5
+            hour = time // 100
+            minute = time % 100
+            start = hour * 100 + minute / 60 * 100
+            _, end = slot_to_day_time(section.slot + section_data.length)
+            end = end // 100 * 100 + (end % 100) / 60 * 100
+
+            # plot classes
+            ax.fill_between(
+                [day, day+1], [start, start], [end, end],
+                facecolor='lightgreen', edgecolor='k', linewidth=2, alpha=0.7)
+            # show time in top left corner
+            ax.text(day+0.05, start+10, '{0}:{1:0>2}'.format(hour, minute),
+                    va='top', fontsize=8)
+            # show class and instructor
+            text = "{}\n{}".format(section_data.course.name, section_data.instructor.name)
+            ax.text(day+0.5, (start+end)*0.5, text,
+                    ha='center', va='center', fontsize=11)
+
+            if section.is_twice_weekly:
+                day += 3
+                # plot classes
+                ax.fill_between(
+                    [day, day+1], [start, start], [end, end],
+                    facecolor='lightgreen', edgecolor='k', linewidth=2, alpha=0.7)
+                # show time in top left corner
+                ax.text(day+0.05, start+10, '{0}:{1:0>2}'.format(hour, minute),
+                        va='top', fontsize=8)
+                # show class and room name
+                text = "{}\n{}".format(section_data.course.name, section_data.instructor.name)
+                ax.text(day+0.5, (start+end)*0.5, text,
+                        ha='center', va='center', fontsize=11)
+
+        # offset title to avoid getting covered by day labels
+        ax.set_title('Room: {}'.format(room.name), y=1.07)
+
+        ax.yaxis.grid()
+        ax.set_xlim(0.5, 5.5)
+        ax.set_ylim(day_end, day_start)
+        ax.set_xticks(range(1, 6))
+        ax.set_xticklabels(days)
+        ax.set_ylabel('Time')
+        ax.set_yticks(range(day_start, day_end, 50))
+        time_labels = []
+        for time in range(day_start, day_end, 100):
+            hour = time // 100
+            time_labels.append('{0}:{1:0>2}'.format(hour, 0))
+            time_labels.append('{0}:{1:0>2}'.format(hour, 30))
+        ax.set_yticklabels(time_labels)
+
+        # show labels on both sides
+        ax2 = ax.twiny().twinx()
+        ax2.set_xlim(ax.get_xlim())
+        ax2.set_ylim(ax.get_ylim())
+        ax2.set_xticks(ax.get_xticks())
+        ax2.set_xticklabels(days)
+        ax2.set_yticks(ax.get_yticks())
+        ax2.set_yticklabels(time_labels)
+
+        filename = os.path.join(outdir, 'room_{}.png'.format(room.name.replace(' ', '_')))
+        print("Writing {}".format(filename))
+        fig.savefig(filename)
+        plt.close(fig)
 
 
 def mig_pipe(deme, k, pipe_in, pipe_out, selection, replacement=None):
@@ -610,6 +779,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("pop", help="population size per deme", type=int)
     parser.add_argument("gens", help="number of generations", type=int)
+    parser.add_argument("--crossover", help="crossover probability", type=float, default=0.6)
+    parser.add_argument("--mutation", help="mutation probability", type=float, default=0.4)
     parser.add_argument("-r", "--runs", help="average results over multiple runs",
                         type=int, default=1)
     parser.add_argument("-c", "--resume", help="result from last checkpoint",
@@ -714,7 +885,7 @@ def main():
 
     validate_faculty_load(faculty, sections)
 
-    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0, -1.0))
+    creator.create("Fitness", base.Fitness, weights=(-1.0, -1.0))
     creator.create("Individual", list, fitness=creator.Fitness)
 
     toolbox = base.Toolbox()
@@ -746,7 +917,7 @@ def main():
         'avg': [],
         'max': [],
     }
-    halloffame = []
+    halloffame = tools.HallOfFame(maxsize=1)
 
     # resume previous run if applicable
     checkpoint = os.path.join(args.outdir, 'runs_cp.pkl')
@@ -767,6 +938,7 @@ def main():
                     'avg': [],
                     'max': [],
                 }
+            # start_run = min(start_run, args.runs)
         except FileNotFoundError:
             print("No checkpoint found. Starting a new run")
             args.resume = False
@@ -817,10 +989,6 @@ def main():
 
         print("Collecting run {} statistics".format(run))
 
-        fit_min = []
-        fit_avg = []
-        fit_max = []
-
         hard_min = []
         hard_avg = []
         hard_max = []
@@ -828,28 +996,21 @@ def main():
         soft_min = []
         soft_avg = []
         soft_max = []
+
         for r in results:
             log = r['logbook']
-            fit_min.append(numpy.array(log.select('min'))[:, 0])
-            fit_avg.append(numpy.array(log.select('avg'))[:, 0])
-            fit_max.append(numpy.array(log.select('max'))[:, 0])
+            hard_min.append(numpy.array(log.select('min'))[:, 0])
+            hard_avg.append(numpy.array(log.select('avg'))[:, 0])
+            hard_max.append(numpy.array(log.select('max'))[:, 0])
 
-            hard_min.append(numpy.array(log.select('min'))[:, 1])
-            hard_avg.append(numpy.array(log.select('avg'))[:, 1])
-            hard_max.append(numpy.array(log.select('max'))[:, 1])
-
-            soft_min.append(numpy.array(log.select('min'))[:, 2])
-            soft_avg.append(numpy.array(log.select('avg'))[:, 2])
-            soft_max.append(numpy.array(log.select('max'))[:, 2])
+            soft_min.append(numpy.array(log.select('min'))[:, 1])
+            soft_avg.append(numpy.array(log.select('avg'))[:, 1])
+            soft_max.append(numpy.array(log.select('max'))[:, 1])
 
             # collect hall of fame members
-            halloffame.extend(r['halloffame'])
+            halloffame.update(r['halloffame'])
 
         # combine results from each deme
-        fit_min = numpy.min(fit_min, axis=0)
-        fit_avg = numpy.mean(fit_avg, axis=0)
-        fit_max = numpy.max(fit_max, axis=0)
-
         hard_min = numpy.min(hard_min, axis=0)
         hard_avg = numpy.mean(hard_avg, axis=0)
         hard_max = numpy.max(hard_max, axis=0)
@@ -859,9 +1020,9 @@ def main():
         soft_max = numpy.max(soft_max, axis=0)
 
         # save run results
-        runs['min'].append(numpy.column_stack((fit_min, hard_min, soft_min)))
-        runs['avg'].append(numpy.column_stack((fit_avg, hard_avg, soft_avg)))
-        runs['max'].append(numpy.column_stack((fit_max, hard_max, soft_max)))
+        runs['min'].append(numpy.column_stack((hard_min, soft_min)))
+        runs['avg'].append(numpy.column_stack((hard_avg, soft_avg)))
+        runs['max'].append(numpy.column_stack((hard_max, soft_max)))
 
         # checkpoint run results since this'll take a while
         with open(os.path.join(args.outdir, 'runs_cp.pkl'), 'wb') as cp_file:
@@ -874,14 +1035,17 @@ def main():
             pickle.dump(cp, cp_file)
 
     # average and plot results
-    gen = results[0]['logbook'].select('gen')
+    # gen = results[0]['logbook'].select('gen')
+    gen = list(range(1, args.gens + 1))
     plot_results(gen, runs, args.outdir)
 
     # get best solution, minimizing hard penalty first
-    best = min(halloffame, key=lambda ind: tuple(ind.fitness.values[1:]))
+    # best = min(halloffame, key=lambda ind: tuple(ind.fitness.values[1:]))
+    best = halloffame[0]
     print("Fittest timetable found: {}".format(toolbox.evaluate(best)))
 
     # export best solution to an sqlite3 db
+    print("Saving timetable to {}".format(os.path.join(args.outdir, 'final_timetable.sqlite3')))
     conn = sqlite3.connect(os.path.join(args.outdir, 'final_timetable.sqlite3'))
     c = conn.cursor()
     c.execute("""
@@ -928,6 +1092,11 @@ def main():
     conn.commit()
     conn.close()
 
+    # export to images
+    image_output = os.path.join(args.outdir, 'img')
+    print("Exporting schedules to {}".format(image_output))
+    export_to_image(best, sections, rooms, image_output)
+
 
 def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=None,
               verbose=__debug__):
@@ -959,14 +1128,14 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
     NGEN = args.gens    # number of generations
     MU = args.pop       # population size
     LAMBDA = MU         # number of offspring to generate each gen
-    CXPB = 0.6          # crossover probability
-    MUTPB = 0.3         # mutation probability
+    CXPB = args.crossover  # 0.6          # crossover probability
+    MUTPB = args.mutation  # 0.4         # mutation probability
     MIG_RATE = 5        # migration rate (generations)
     MIG_K = 5           # number of individuals migrated
-    RR_THRESH = 20      # random restart if no improvement/stagnated
+    RR_THRESH = 50      # random restart if no improvement/stagnated
     RR_KEEP = 5         # keep the best individuals during a restart
     CHKPOINT = 10       # checkpoint frequency
-    LOG_RATE = 25       # hall of fame log frequency
+    LOG_RATE = 10       # hall of fame log frequency
 
     # set up migration pipes
     toolbox.register("migrate", mig_pipe, k=MIG_K, pipe_in=pipe_in,
@@ -994,7 +1163,7 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
         deme = toolbox.population(MU)
         start_gen = 1
         random.seed(seed)
-        hof = tools.HallOfFame(maxsize=MU)
+        hof = tools.HallOfFame(maxsize=1)
         logbook = tools.Logbook()
         logbook.header = ('gen', 'deme', 'nevals', 'std', 'min', 'avg', 'max')
 
@@ -1042,6 +1211,11 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
         fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
         for ind, fit in zip(invalid_ind, fitnesses):
+            ## feasible solutions take priority over infeasible
+            #if fit[1] == 0:
+            #    fit = list(fit)
+            #    fit[0] = 0
+            #    fit = tuple(fit)
             ind.fitness.values = fit
 
         # Update the hall of fame with the generated individuals
@@ -1061,7 +1235,8 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
             toolbox.migrate(deme)
 
         # random restart if best solution hasn't improved (stagnation)
-        if gen % RR_THRESH == 0:
+        # NOTE: disabled. didn't seem to help much
+        if False and gen % RR_THRESH == 0:
             current_avg = tuple(logbook[-1]['avg'])
             old_avg = tuple(logbook[-RR_THRESH]['avg'])
 
@@ -1076,6 +1251,11 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
                 invalid_ind = [ind for ind in new_pop if not ind.fitness.valid]
                 fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
                 for ind, fit in zip(invalid_ind, fitnesses):
+                    ## feasible solutions take priority over infeasible
+                    #if fit[1] == 0:
+                    #    fit = list(fit)
+                    #    fit[0] = 0
+                    #    fit = tuple(fit)
                     ind.fitness.values = fit
 
                 if hof is not None:
@@ -1086,7 +1266,7 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
 
         # log current hall of fame individual regularly
         if gen % LOG_RATE == 0:
-            print("Deme {} best: {}".format(procid, hof[0].fitness.values))
+            print("Gen {} Deme {} best: {}".format(gen, procid, hof[0].fitness.values))
 
         # checkpoint
         if gen % CHKPOINT == 0 or gen == NGEN:
@@ -1110,6 +1290,3 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
 
 if __name__ == '__main__':
     main()
-
-    # possible improvements:
-    # focus mutation on genes/sections involved in conflicts

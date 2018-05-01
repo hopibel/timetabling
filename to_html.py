@@ -1,9 +1,10 @@
 """Room view HTML visualizer for timetable."""
 
 from collections import defaultdict
+import os
 
 
-def to_html(ind, sections, slots, day_slots):
+def to_html(ind, sections, slots, day_slots, day_start, outdir):
     """Convert timetable to html table."""
     rooms = defaultdict(list)
     for section in ind:
@@ -77,7 +78,7 @@ def to_html(ind, sections, slots, day_slots):
 """[1:-1])
         for i, row in enumerate(rows):
             table.append("<tr>")
-            table.append("<td>{}</td>".format(str(600 + 100*(i//2) + (i % 2)*30).zfill(4)))
+            table.append("<td>{}</td>".format(str(day_start + 100*(i//2) + (i % 2)*30).zfill(4)))
             for cell in row:
                 if cell[2] == []:
                     table.append("<td>&nbsp;</td>")
@@ -115,6 +116,6 @@ td { text-align: center; }
         for line in table:
             html.append(line)
 
-    with open('room_sched.html', 'w') as outfile:
+    with open(os.path.join(outdir, 'room_sched.html'), 'w') as outfile:
         for line in html:
             outfile.write(line + "\n")

@@ -327,14 +327,7 @@ def eval_timetable(individual, sections, program_sizes, study_plans):
     # soft constraint fitness (penalty. minimize)
     soft_penalty = soft_fitness(individual, sections)
 
-    # sum of penalties or zero if hard_penalty == 0
-    if hard_penalty == 0:
-        combined_penalty = 0
-    else:
-        combined_penalty = hard_penalty + soft_penalty
-
     return (hard_penalty, soft_penalty)
-    #return (combined_penalty, hard_penalty, soft_penalty)
 
 
 def soft_fitness(individual, sections):

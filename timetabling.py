@@ -4,7 +4,6 @@ import sys
 import os
 import signal
 import argparse
-import math
 import random
 import sqlite3
 import pickle
@@ -18,8 +17,6 @@ from deap import algorithms
 from deap import base
 from deap import creator
 from deap import tools
-
-import to_html
 
 DAY_START_TIME = 600
 DAY_SLOTS = 28

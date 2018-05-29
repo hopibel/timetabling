@@ -963,7 +963,6 @@ def main():
             pipes_in = deque(p[0] for p in pipes)
             pipes_out = deque(p[1] for p in pipes)
             pipes_in.rotate(1)
-            pipes_out.rotate(-1)
 
             e = Event()
             out_queue = Queue()

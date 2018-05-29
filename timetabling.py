@@ -683,7 +683,7 @@ def export_to_image(best, sections, rooms, outdir):
             ax.text(day+0.05, start+10, '{0}:{1:0>2}'.format(hour, minute),
                     va='top', fontsize=8)
             # show class and instructor
-            text = "{}\n{}".format(section_data.course.name, section_data.instructor.name)
+            text = "{} - {}\n{}".format(section_data.course.name, section_data.id_, section_data.instructor.name)
             ax.text(day+0.5, (start+end)*0.5, text,
                     ha='center', va='center', fontsize=11)
 
@@ -697,7 +697,7 @@ def export_to_image(best, sections, rooms, outdir):
                 ax.text(day+0.05, start+10, '{0}:{1:0>2}'.format(hour, minute),
                         va='top', fontsize=8)
                 # show class and room name
-                text = "{}\n{}".format(section_data.course.name, section_data.instructor.name)
+                text = "{} - {}\n{}".format(section_data.course.name, section_data.id_, section_data.instructor.name)
                 ax.text(day+0.5, (start+end)*0.5, text,
                         ha='center', va='center', fontsize=11)
 

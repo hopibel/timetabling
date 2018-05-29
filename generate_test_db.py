@@ -275,7 +275,7 @@ instructors = [
 ]
 rows = []
 for name in instructors:
-    rows.append((name, random.choice((2, 3))))
+    rows.append((name, random.choice((3, 6))))
 c.executemany(
     'INSERT or REPLACE INTO instructors VALUES (?, ?)', rows)
 

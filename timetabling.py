@@ -360,12 +360,17 @@ def soft_fitness(individual, sections):
         # sort by timeslot
         meetings.sort(key=lambda x: x.slot)
 
-        consecutive = 1
+        consecutive = 0
         for i in range(len(meetings) - 1):
             a = meetings[i]
             b = meetings[i + 1]
 
             a_data = sections[a.section_id]
+            b_data = sections[b.section_id]
+
+            # initialize consecutive
+            if i == 0:
+                consecutive += a_data.length
 
             # check if same day
             # ignore gap if it is from the instructor's availability schedule
@@ -378,18 +383,18 @@ def soft_fitness(individual, sections):
 
                 # count_consecutive
                 if a.slot + a_data.length == b.slot:
-                    consecutive += 1
+                    consecutive += b_data.length
                     if consecutive > instructor.max_consecutive:
-                        consecutive_penalty += 1
+                        consecutive_penalty += consecutive - instructor.max_consecutive
                 else:
                     # if gap prevents consecutive_penalty, reduce gap penalty
                     if consecutive == instructor.max_consecutive and len(gap) > instructor_avail_gap:
                         gap_length -= 1
-                    consecutive = 1
+                    consecutive = 0
                 assert gap_length - old_gap >= 0
             else:
                 # reset consecutive count between days
-                consecutive = 1
+                consecutive = 0
 
     return gap_length + consecutive_penalty
 
@@ -767,17 +772,19 @@ def mig_pipe(deme, k, pipe_in, pipe_out, selection, replacement=None):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("pop", help="population size per deme", type=int)
-    parser.add_argument("gens", help="number of generations", type=int)
+    parser.add_argument("--pop", help="population size per deme", type=int, default=100)
+    parser.add_argument("--gens", help="number of generations. If not provided, run until optimal timetable found", type=int)
+    parser.add_argument("--fast", help="If set, terminate on the first feasible timetable",
+                        action='store_true')
     parser.add_argument("--crossover", help="crossover probability", type=float, default=0.6)
     parser.add_argument("--mutation", help="mutation probability", type=float, default=0.4)
     parser.add_argument("-r", "--runs", help="average results over multiple runs",
                         type=int, default=1)
     parser.add_argument("-c", "--resume", help="result from last checkpoint",
                         action='store_true')
-    parser.add_argument("-d", "--database",
+    parser.add_argument("database",
                         help="sqlite3 database to use",
-                        type=str, default='database.sqlite3')
+                        type=str)
     parser.add_argument("-o", "--outdir", help="output directory name",
                         default="output")
     parser.add_argument("-v", "--verbose", help="log per-generation stats to console",
@@ -835,7 +842,8 @@ def main():
     # import instructors
     faculty = {}
     for name, max_consecutive in c.execute('select * from instructors'):
-        faculty[name] = Instructor(name, availabilities[name], max_consecutive)
+        # also convert max_consecutive hours to time slots
+        faculty[name] = Instructor(name, availabilities[name], max_consecutive * 2)
 
     # import restrictions
     restrictions = {}
@@ -921,8 +929,8 @@ def main():
                 gens = cp['gens']
 
             # discard results if number of generations changed
-            # can't collect stats on different length runs
-            if args.gens != gens:
+            # can't collect stats on different length runs or endless ones
+            if args.gens != gens or args.gens is None:
                 runs = {
                     'min': [],
                     'avg': [],
@@ -946,87 +954,110 @@ def main():
     for run in range(start_run, args.runs+1):
         print("Started run {}/{}".format(run, args.runs))
 
-        # set up migration pipes in ring topology
-        pipes = [Pipe(False) for _ in range(NBR_DEMES)]
-        pipes_in = deque(p[0] for p in pipes)
-        pipes_out = deque(p[1] for p in pipes)
-        pipes_in.rotate(1)
-        pipes_out.rotate(-1)
+        # endless runs if args.gens is None
+        # resume runs in increments of 100 generations until 0 conflicts
+        current_best = (float('inf'), float('inf'))
+        while True:
+            # set up migration pipes in ring topology
+            pipes = [Pipe(False) for _ in range(NBR_DEMES)]
+            pipes_in = deque(p[0] for p in pipes)
+            pipes_out = deque(p[1] for p in pipes)
+            pipes_in.rotate(1)
+            pipes_out.rotate(-1)
 
-        e = Event()
-        out_queue = Queue()
+            e = Event()
+            out_queue = Queue()
 
-        processes = [
-            Process(target=mp_evolve,
-                    args=(args, toolbox, i, ipipe, opipe, e, out_queue,
-                          random.random(), args.verbose))
-            for i, (ipipe, opipe)
-            in enumerate(zip(pipes_in, pipes_out))
-        ]
+            processes = [
+                Process(target=mp_evolve,
+                        args=(args, toolbox, i, ipipe, opipe, e, out_queue,
+                              random.random(), args.verbose))
+                for i, (ipipe, opipe)
+                in enumerate(zip(pipes_in, pipes_out))
+            ]
 
-        for proc in processes:
-            proc.start()
+            for proc in processes:
+                proc.start()
 
-        # prevent succeeding runs from trying to resume with old checkpoint
-        args.resume = False
+            # prevent succeeding runs from trying to resume with old checkpoint
+            args.resume = False
 
-        results = []
-        for i in range(NBR_DEMES):
-            results.append(out_queue.get())
+            results = []
+            for i in range(NBR_DEMES):
+                results.append(out_queue.get())
 
-        for proc in processes:
-            proc.join()
+            for proc in processes:
+                proc.join()
 
-        print("Collecting run {} statistics".format(run))
+            print("Collecting run {} statistics".format(run))
 
-        hard_min = []
-        hard_avg = []
-        hard_max = []
+            hard_min = []
+            hard_avg = []
+            hard_max = []
 
-        soft_min = []
-        soft_avg = []
-        soft_max = []
+            soft_min = []
+            soft_avg = []
+            soft_max = []
 
-        for r in results:
-            log = r['logbook']
-            hard_min.append(numpy.array(log.select('min'))[:, 0])
-            hard_avg.append(numpy.array(log.select('avg'))[:, 0])
-            hard_max.append(numpy.array(log.select('max'))[:, 0])
+            for r in results:
+                log = r['logbook']
+                hard_min.append(numpy.array(log.select('min'))[:, 0])
+                hard_avg.append(numpy.array(log.select('avg'))[:, 0])
+                hard_max.append(numpy.array(log.select('max'))[:, 0])
 
-            soft_min.append(numpy.array(log.select('min'))[:, 1])
-            soft_avg.append(numpy.array(log.select('avg'))[:, 1])
-            soft_max.append(numpy.array(log.select('max'))[:, 1])
+                soft_min.append(numpy.array(log.select('min'))[:, 1])
+                soft_avg.append(numpy.array(log.select('avg'))[:, 1])
+                soft_max.append(numpy.array(log.select('max'))[:, 1])
 
-            # collect hall of fame members
-            halloffame.update(r['halloffame'])
+                # collect hall of fame members
+                halloffame.update(r['halloffame'])
 
-        # combine results from each deme
-        hard_min = numpy.min(hard_min, axis=0)
-        hard_avg = numpy.mean(hard_avg, axis=0)
-        hard_max = numpy.max(hard_max, axis=0)
+            # combine results from each deme
+            hard_min = numpy.min(hard_min, axis=0)
+            hard_avg = numpy.mean(hard_avg, axis=0)
+            hard_max = numpy.max(hard_max, axis=0)
 
-        soft_min = numpy.min(soft_min, axis=0)
-        soft_avg = numpy.mean(soft_avg, axis=0)
-        soft_max = numpy.max(soft_max, axis=0)
+            soft_min = numpy.min(soft_min, axis=0)
+            soft_avg = numpy.mean(soft_avg, axis=0)
+            soft_max = numpy.max(soft_max, axis=0)
 
-        # save run results
-        runs['min'].append(numpy.column_stack((hard_min, soft_min)))
-        runs['avg'].append(numpy.column_stack((hard_avg, soft_avg)))
-        runs['max'].append(numpy.column_stack((hard_max, soft_max)))
+            # save run results. append to last run if endless
+            if args.gens is None and len(runs['min']) > 0:
+                runs['min'][0] = numpy.column_stack((hard_min, soft_min))
+                runs['avg'][0] = numpy.column_stack((hard_avg, soft_avg))
+                runs['max'][0] = numpy.column_stack((hard_max, soft_max))
+            else:
+                runs['min'].append(numpy.column_stack((hard_min, soft_min)))
+                runs['avg'].append(numpy.column_stack((hard_avg, soft_avg)))
+                runs['max'].append(numpy.column_stack((hard_max, soft_max)))
 
-        # checkpoint run results since this'll take a while
-        with open(os.path.join(args.outdir, 'runs_cp.pkl'), 'wb') as cp_file:
-            cp = dict(
-                start_run=run,
-                runs=runs,
-                halloffame=halloffame,
-                gens=args.gens
-            )
-            pickle.dump(cp, cp_file)
+            # checkpoint run results since this'll take a while
+            with open(os.path.join(args.outdir, 'runs_cp.pkl'), 'wb') as cp_file:
+                cp = dict(
+                    start_run=run,
+                    runs=runs,
+                    halloffame=halloffame,
+                    gens=args.gens
+                )
+                pickle.dump(cp, cp_file)
+
+            if args.gens is not None:
+                break
+            else:
+                fit = halloffame[0].fitness.values
+                if fit[0] == 0 and (args.fast or fit[1] == 0 or not fit < current_best):
+                    break
+                else:
+                    # resume evolution until next multiple of 100 generations
+                    args.resume = True
+                    current_best = fit
+
+        # only one run if endless
+        if args.gens is None:
+            break
 
     # average and plot results
-    # gen = results[0]['logbook'].select('gen')
-    gen = list(range(1, args.gens + 1))
+    gen = list(range(1, len(runs['min'][0]) + 1))
     plot_results(gen, runs, args.outdir)
 
     # get best solution, minimizing hard penalty first
@@ -1189,6 +1220,10 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
                 sync.wait()
                 print(logbook.stream)
 
+    # update NGEN if endless
+    if NGEN is None:
+        NGEN = start_gen // 100 * 100 + 100
+
     # Begin the generational process
     for gen in range(start_gen + 1, NGEN + 1):
         # Select the next generation population
@@ -1201,11 +1236,11 @@ def mp_evolve(args, toolbox, procid, pipe_in, pipe_out, sync, out_queue, seed=No
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
         fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
         for ind, fit in zip(invalid_ind, fitnesses):
-            ## feasible solutions take priority over infeasible
-            #if fit[1] == 0:
-            #    fit = list(fit)
-            #    fit[0] = 0
-            #    fit = tuple(fit)
+            # # feasible solutions take priority over infeasible
+            # if fit[1] == 0:
+            #     fit = list(fit)
+            #     fit[0] = 0
+            #     fit = tuple(fit)
             ind.fitness.values = fit
 
         # Update the hall of fame with the generated individuals
